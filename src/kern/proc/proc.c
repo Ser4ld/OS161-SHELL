@@ -49,6 +49,9 @@
 #include <addrspace.h>
 #include <vnode.h>
 #include <syscall.h>
+#include <vfs.h>   
+#include <kern/errno.h>    
+#include <kern/fcntl.h>
 
 #if OPT_WAITPID
 #include <synch.h>
@@ -354,6 +357,49 @@ proc_create_runprogram(const char *name)
 	return newproc;
 }
 
+#if OPT_FILE
+int 
+console_initialization(const char *lockname, struct proc *p, int fd, int openflags)
+{
+	struct vnode *console_vn;
+	struct openfile *of = NULL;
+	char console_path[] = "con:";
+	int result, sft_index;
+	
+	(void)lockname;
+
+	result = vfs_open(console_path, openflags, 0, &console_vn);
+	if (result) {
+		return result;
+	}
+
+	spinlock_acquire(&systemFileTable_spinlock);
+	for (sft_index = 0; sft_index < SYSTEM_OPEN_MAX; sft_index++) {
+		if (systemFileTable[sft_index].vn == NULL) {
+			systemFileTable[sft_index].vn = console_vn;
+			systemFileTable[sft_index].offset = 0;
+			systemFileTable[sft_index].countRef = 1;
+			systemFileTable[sft_index].openflags = openflags;
+			of = &systemFileTable[sft_index];
+			break;
+		}
+	}
+	spinlock_release(&systemFileTable_spinlock);
+
+	if (of == NULL) {  /* ← Controlla of invece di sft_index (più chiaro) */
+		vfs_close(console_vn);
+		return ENFILE;
+	}
+
+
+	spinlock_acquire(&p->fileTable_spinlock);
+	p->fileTable[fd] = of;
+	spinlock_release(&p->fileTable_spinlock);
+
+	return 0;
+}
+#endif
+
 /*
  * Add a thread to a process. Either the thread or the process might
  * or might not be current.
@@ -454,7 +500,7 @@ proc_setas(struct addrspace *newas)
 
 
 
-        /* G.Cabodi - 2019 - support for waitpid */
+/* G.Cabodi - 2019 - support for waitpid */
 int 
 proc_wait(struct proc *proc)
 {

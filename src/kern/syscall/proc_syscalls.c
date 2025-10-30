@@ -1,10 +1,3 @@
-/*
- * AUthor: G.Cabodi
- * Very simple implementation of sys__exit.
- * It just avoids crash/panic. Full process exit still TODO
- * Address space is released
- */
-
 #include <types.h>
 #include <kern/unistd.h>
 #include <kern/errno.h>

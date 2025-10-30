@@ -9,5 +9,6 @@ syscall.o: ../../arch/mips/syscall/syscall.c ../../include/types.h \
  includelinks/machine/thread.h ../../include/setjmp.h \
  includelinks/kern/machine/setjmp.h ../../include/addrspace.h \
  ../../include/vm.h includelinks/machine/vm.h opt-dumbvm.h \
- ../../include/syscall.h opt-syscalls.h opt-file.h opt-fork.h opt-execv.h \
- opt-shell.h
+ ../../include/syscall.h ../../include/limits.h \
+ ../../include/kern/limits.h opt-syscalls.h opt-file.h opt-fork.h \
+ opt-execv.h opt-shell.h

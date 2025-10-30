@@ -32,6 +32,7 @@
 
 
 #include <cdefs.h> /* for __DEAD */
+#include <limits.h>
 #include "opt-syscalls.h"
 #include "opt-file.h"
 #include "opt-fork.h"
@@ -66,27 +67,52 @@ int sys_reboot(int code);
 int sys___time(userptr_t user_seconds, userptr_t user_nanoseconds);
 #if OPT_SYSCALLS
 #if OPT_FILE
-struct openfile;
+
+#define SYSTEM_OPEN_MAX (10*OPEN_MAX)
+
+struct openfile {
+	struct vnode *vn; 
+	off_t offset;              
+	unsigned int countRef;      
+	int openflags;              
+};
+
+/* System-wide open file table and its lock */
+extern struct openfile systemFileTable[SYSTEM_OPEN_MAX];
+extern struct spinlock systemFileTable_spinlock;
+
 void openfileIncrRefCount(struct openfile *of);
+
 int sys_open(userptr_t path, int openflags, mode_t mode, int *errp);
 int sys_close(int fd);
+
 #endif
+
 int sys_write(int fd, userptr_t buf_ptr, size_t size, int *retval);
 int sys_read(int fd, userptr_t buf_ptr, size_t size, int *retval);
 void sys__exit(int status);
 int sys_waitpid(pid_t pid, userptr_t statusp, int options, int *retval);
 pid_t sys_getpid(void);
+
 #if OPT_SHELL
 int sys_lseek(int fd, off_t pos, int whence, int32_t *retval, int32_t *retval2);
 int sys_dup2(int oldfd, int newfd, int *retval);
 int sys_chdir(const_userptr_t pathname);
 int sys___getcwd(userptr_t buf, size_t buflen, int *retval);
+
+struct proc;
+int console_initialization(const char *lockname, struct proc *p, int fd, int openflags);
+
 #endif
 #if OPT_FORK
+
 int sys_fork(struct trapframe *ctf, pid_t *retval);
+
 #endif
 #if OPT_EXECV
+
 int sys_execv(const char *program, char **args);
+
 #endif
 #endif
 
