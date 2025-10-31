@@ -549,6 +549,11 @@ void
 proc_addChild(struct proc *parent, pid_t child_pid)
 {
 	pid_t *temp = (pid_t *)kmalloc(sizeof(pid_t));
+
+	if (temp == NULL) {
+		panic("proc_addChild: out of memory");
+    }
+
 	*temp = child_pid;
 
 	spinlock_acquire(&parent->p_lock);

@@ -1,9 +1,11 @@
 #include <types.h>
 #include <kern/unistd.h>
 #include <kern/errno.h>
+#include <kern/limits.h>
 #include <clock.h>
 #include <copyinout.h>
 #include <syscall.h>
+#include <limits.h>  
 #include <lib.h>
 #include <proc.h>
 #include <thread.h>
@@ -103,8 +105,8 @@ static void
 call_enter_forked_process(void *tfv, unsigned long dummy) {
   struct trapframe *tf = (struct trapframe *)tfv;
   (void)dummy;
-  enter_forked_process(tf); 
  
+  enter_forked_process(tf); 
   panic("enter_forked_process returned (should not happen)\n");
 }
 
@@ -122,17 +124,17 @@ int sys_fork(struct trapframe *ctf, pid_t *retval) {
     return ENOMEM;
   }
 
+#if OPT_FILE
   proc_addChild(curproc, newp->p_pid);
+#endif
 
-  /* done here as we need to duplicate the address space 
-     of thbe current process */
-  as_copy(curproc->p_addrspace, &(newp->p_addrspace));
-  if(newp->p_addrspace == NULL){
+  result = as_copy(curproc->p_addrspace, &(newp->p_addrspace));
+  if(result) {  
     proc_destroy(newp);
-    return ENOMEM; 
-  }
+    return result;
+  }  
 
-  proc_file_table_copy(newp,curproc);
+  proc_file_table_copy(curproc, newp);
 
   /* we need a copy of the parent's trapframe */
   tf_child = kmalloc(sizeof(struct trapframe));
@@ -141,6 +143,7 @@ int sys_fork(struct trapframe *ctf, pid_t *retval) {
     return ENOMEM; 
   }
   memcpy(tf_child, ctf, sizeof(struct trapframe));
+
   
   newp->parent = curproc;
 
@@ -156,14 +159,12 @@ int sys_fork(struct trapframe *ctf, pid_t *retval) {
   }
 
   *retval = newp->p_pid;
-
   return 0;
 }
 #endif
 
 #if OPT_EXECV
-int
-sys_execv(const char *program, char **args)
+int sys_execv(const char *program, char **args)
 {
   int i, result, argc, arglen;
   char **kargs, **uargs;
@@ -171,126 +172,157 @@ sys_execv(const char *program, char **args)
   struct vnode *v;
   struct addrspace *as;
   vaddr_t entrypoint, stackptr;
-  size_t stackoffset = 0;
 
-  if(program == NULL || args == NULL)
+
+  if(program == NULL || args == NULL) {
     return EFAULT;
-
-  if(program == '\0')
-    return ENOEXEC;
+  }
   
-  /* The argument strings should be copied from user space to kernel */
 
-  for(i=0;args[i]!=NULL;i++);
-	KASSERT(args[i] == NULL);
-	if(i >= ARG_MAX)
-		return E2BIG;
+  /* Count arguments */
+  for(i=0; args[i]!=NULL; i++);
 
-	kargs = (char **) kmalloc(sizeof(char **) *i);
-	if(kargs==NULL)
-		return ENOMEM;
+  KASSERT(args[i] == NULL);
+  if(i >= ARG_MAX) {
+    return E2BIG;
+  }
 
-	i=0;
-	while(args[i] != NULL) {
-    kargs[i] = kmalloc(strlen(args[i])+1);
-		if(kargs[i] == NULL)	
-			return ENOMEM;
+  kargs = (char **) kmalloc(sizeof(char *) * i);
+  if(kargs == NULL) {
+    return ENOMEM;
+  }
 
-		result = copyinstr((userptr_t)args[i], kargs[i], strlen(args[i])+1, NULL);
-		if(result) {
-			kfree(kargs);
-			return result;
-		}
-		i++;
-	}
-	argc = i;
-	kargs[i] = NULL;
+  /* Copy arguments */
+  i = 0;
+  while(args[i] != NULL) {
+    kargs[i] = kmalloc(ARG_MAX);
+    if(kargs[i] == NULL) {
+      for(int j = 0; j < i; j++) kfree(kargs[j]);
+      kfree(kargs);
+      return ENOMEM;
+    }
 
-	kprogname = (char *)kmalloc(strlen(program)+1);
-	if(kprogname == NULL)	
-		return ENOMEM;
-	result = copyinstr((userptr_t)program, kprogname, strlen(program)+1, NULL);
-	if(result){
-		kfree(kargs);
-		kfree(kprogname);
-		return result;
-	}
+    result = copyinstr((userptr_t)args[i], kargs[i], ARG_MAX, NULL);
+    if(result) {
+      for(int j = 0; j <= i; j++) kfree(kargs[j]);
+      kfree(kargs);
+      return result;
+    }
+    i++;
+  }
+  
+  argc = i;
+  kargs[i] = NULL;
 
-  /* Open file, load elf into newly created address space */
-	
-	result = vfs_open(kprogname, O_RDONLY, 0, &v);
-	if (result)
-		return result;
+  /* Copy program name */
+  kprogname = (char *)kmalloc(PATH_MAX);
+  if(kprogname == NULL) {
+    for(i = 0; i < argc; i++) kfree(kargs[i]);
+    kfree(kargs);
+    return ENOMEM;
+  }
 
+  result = copyinstr((userptr_t)program, kprogname, PATH_MAX, NULL);
+  if(result) {
+    for(i = 0; i < argc; i++) kfree(kargs[i]);
+    kfree(kargs);
+    kfree(kprogname);
+    return result;
+  }
+
+  /* Open file */
+  result = vfs_open(kprogname, O_RDONLY, 0, &v);
+  if (result) {
+    for(i = 0; i < argc; i++) kfree(kargs[i]);
+    kfree(kargs);
+    kfree(kprogname);
+    return result;
+  }
+
+  /* Replace address space */ 
   proc_setas(NULL);
-	KASSERT(proc_getas() == NULL);
+  KASSERT(proc_getas() == NULL);
 
-	as = as_create();
-	if (as == NULL) {		
-		vfs_close(v);
-		return ENOMEM;
-	}
+  as = as_create();
+  if (as == NULL) {
+    vfs_close(v);
+    for(i = 0; i < argc; i++) kfree(kargs[i]);
+    kfree(kargs);
+    kfree(kprogname);
+    return ENOMEM;
+  }
 
-	proc_setas(as);
-	as_activate();
+  proc_setas(as);
+  as_activate();
 
-	result = load_elf(v, &entrypoint);
-	if (result) {
-		vfs_close(v);
-		return result;
-	}
-	vfs_close(v);
+  /* Load ELF */
+  result = load_elf(v, &entrypoint);
+  if (result) {
+    vfs_close(v);
+    for(i = 0; i < argc; i++) kfree(kargs[i]);
+    kfree(kargs);
+    kfree(kprogname);
+    return result;
+  }
+  vfs_close(v);
 
-	result = as_define_stack(as, &stackptr);
-	if (result) {
-		return result;
-	}
+  /* Set up stack */
+  result = as_define_stack(as, &stackptr);
+  if (result) {
+    for(i = 0; i < argc; i++) kfree(kargs[i]);
+    kfree(kargs);
+    kfree(kprogname);
+    return result;
+  }
 
-	/* The argument strings should be copied into the new process as the new process's argv[] array */
+  /* Copy arguments to user stack */
+  uargs = (char **)kmalloc(sizeof(char *) * argc);
+  if(uargs == NULL) {
+    for(i = 0; i < argc; i++) kfree(kargs[i]);
+    kfree(kargs);
+    kfree(kprogname);
+    return ENOMEM;
+  }
+  uargs[argc] = NULL;
 
-	uargs = (char **)kmalloc(sizeof(char **) * argc);
-	if(uargs == NULL)
-		return ENOMEM;
-	uargs[argc] = 0;
+  for(i = 0; i < argc; i++) {
+    arglen = strlen(kargs[i]) + 1;
+    stackptr -= arglen;
+    if(stackptr & 0x3)
+      stackptr -= (stackptr & 0x3);
 
-	for(i = 0; i < argc; ++i) {
-		uargs[i] =(char*)kmalloc(sizeof(char*));
-		if(uargs[i] == NULL)	
-				return ENOMEM;
-		arglen = strlen(kargs[i]) + 1;
+    result = copyoutstr(kargs[i], (userptr_t)stackptr, arglen, NULL);
+    if(result) {
+      for(int j = 0; j < argc; j++) kfree(kargs[j]);
+      kfree(kargs);
+      kfree(kprogname);
+      kfree(uargs);
+      return result;
+    }
+    uargs[i] = (char *)stackptr;
+  }
 
-		stackptr -= arglen;
+  /* Copy argv array */
+  stackptr -= sizeof(char *) * (argc + 1);
 
-		if(stackptr & 0x3)
-			stackptr -= (stackptr & 0x3); //padding
+  result = copyout(uargs, (userptr_t)stackptr, sizeof(char *) * argc);
+  if(result) {
+    for(i = 0; i < argc; i++) kfree(kargs[i]);
+    kfree(kargs);
+    kfree(kprogname);
+    kfree(uargs);
+    return result;
+  }
 
-		result = copyoutstr(kargs[i], (userptr_t)stackptr , arglen, NULL);
-	
-		if(result){
-			kfree(kargs);
-			return result;
-		}
+  /* Cleanup */
+  for(i = 0; i < argc; i++) kfree(kargs[i]);
+  kfree(kargs);
+  kfree(kprogname);
+  kfree(uargs);
 
-    // saving the address of the stackptr for each element
-		uargs[i] = (char *)stackptr;
-	}
-
-  // adjusting stack head
-	stackoffset += sizeof(char *)*(argc+1);
-	stackptr = stackptr - stackoffset;
-
-	result = copyout(uargs, (userptr_t) stackptr, sizeof(char *)*(argc));
-	if(result){
-		kfree(kargs);
-		return result;
-	}
-
-	// return to user mode using enter_new_process
-	enter_new_process(argc /*argc*/, (userptr_t)stackptr /*(void*)argsuserspace addr of argv*/,
-			  NULL /*userspace addr of environment*/,
-			  stackptr, entrypoint);
-	
-	panic("enter_new_process returned\n");
-	return EINVAL;
+  enter_new_process(argc, (userptr_t)stackptr, NULL, stackptr, entrypoint);
+  
+  panic("enter_new_process returned\n");
+  return EINVAL;
 }
 #endif
