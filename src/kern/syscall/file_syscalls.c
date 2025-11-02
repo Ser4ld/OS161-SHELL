@@ -786,6 +786,19 @@ sys_lseek(int fd, off_t pos, int whence, int32_t *retval, int32_t *retval2)
   return 0;
 }
 
+/*
+ * sys_dup2 - Duplicate a file descriptor to a specific descriptor number
+ * 
+ * Arguments:
+ *   oldfd - existing file descriptor to duplicate
+ *   newfd - target file descriptor number
+ *   retval - output parameter: returns newfd on success
+ * 
+ * Returns:
+ *   0 on success (retval contains newfd)
+ *   EBADF if oldfd is not a valid open file descriptor
+ *   EBADF if newfd is out of valid range [0, OPEN_MAX)
+ */
 int 
 sys_dup2(int oldfd, int newfd, int *retval)
 {

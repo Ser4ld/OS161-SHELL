@@ -20,8 +20,14 @@
 #define MAX_PROC 100
 
 /*
- * system calls for process management
- */
+ * sys__exit - Terminate the current process with an exit status
+ * 
+ * Arguments:
+ *   status - exit status code (only lower 8 bits are used)
+ * 
+ * Returns:
+ *   Does not return (process terminates)
+ */ 
 void
 sys__exit(int status)
 {
@@ -36,7 +42,6 @@ sys__exit(int status)
     as_destroy(as);
   }
   p->p_status = status & 0xff; /* just lower 8 bits returned */
-  //proc_remthread(curthread);
   proc_signal_end(p);
 #else
   /* get address space of current process and destroy */
@@ -46,7 +51,7 @@ sys__exit(int status)
   thread_exit();
 
   panic("thread_exit returned (should not happen)\n");
-  (void) status; // TODO: status handling
+  (void) status;
 }
 
 int
@@ -84,13 +89,11 @@ sys_waitpid(pid_t pid, userptr_t statusp, int options, int *retval)
     return ECHILD;
   }
   
-  // ⭐ Questo potrebbe crashare se curproc è corrotto
   if(p->parent != curproc) {
     return ECHILD;
   }
-  
+ 
   s = proc_wait(p);
-
   s = _MKWAIT_EXIT(s);
 
   if (statusp!=NULL) {
@@ -130,6 +133,17 @@ call_enter_forked_process(void *tfv, unsigned long dummy) {
   panic("enter_forked_process returned (should not happen)\n");
 }
 
+/*
+ * sys_fork - Create a new process by duplicating the calling process
+ * 
+ * Arguments:
+ *   ctf - pointer to current trapframe (contains CPU state at syscall entry)
+ *   retval - output parameter: returns child's PID to parent, 0 to child
+ * 
+ * Returns:
+ *   0 on success (retval contains child PID in parent process)
+ *   ENOMEM if insufficient memory for new process/thread/trapframe
+ */
 int sys_fork(struct trapframe *ctf, pid_t *retval) {
   struct trapframe *tf_child;
   struct proc *newp;
@@ -184,6 +198,23 @@ int sys_fork(struct trapframe *ctf, pid_t *retval) {
 #endif
 
 #if OPT_EXECV
+/*
+ * sys_execv - Replace current process image with a new program
+ * 
+ * Arguments:
+ *   program - path to the executable file to load
+ *   args - NULL-terminated array of argument strings (argv)
+ * 
+ * Returns:
+ *   On success: does not return (process is replaced)
+ *   On error: returns appropriate error code:
+ *     EFAULT - program or args pointer is NULL or invalid
+ *     E2BIG - too many arguments (>= ARG_MAX)
+ *     ENOMEM - insufficient memory for operation
+ *     EINVAL - program name is empty string
+ *     ENODEV, ENOTDIR, ENOENT - error opening executable file
+ *     ENOEXEC - file is not a valid executable
+ */
 int sys_execv(const char *program, char **args)
 {
   int i, result, argc, arglen;
