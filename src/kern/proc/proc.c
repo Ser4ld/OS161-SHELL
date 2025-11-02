@@ -80,6 +80,8 @@ proc_search_pid(pid_t pid) {
   struct proc *p;
   KASSERT(pid>=0&&pid<MAX_PROC);
   p = processTable.proc[pid];
+  if(p == NULL)
+    return NULL;
   KASSERT(p->p_pid==pid);
   return p;
 #else

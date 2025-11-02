@@ -2,6 +2,7 @@
 #include <kern/unistd.h>
 #include <kern/errno.h>
 #include <kern/limits.h>
+#include <kern/wait.h>
 #include <clock.h>
 #include <copyinout.h>
 #include <syscall.h>
@@ -28,6 +29,12 @@ sys__exit(int status)
 
 #if OPT_WAITPID
   struct proc *p = curproc;
+
+  struct addrspace *as = proc_getas();
+  if(as != NULL) {
+    proc_setas(NULL);
+    as_destroy(as);
+  }
   p->p_status = status & 0xff; /* just lower 8 bits returned */
   //proc_remthread(curthread);
   proc_signal_end(p);
@@ -50,28 +57,41 @@ sys_waitpid(pid_t pid, userptr_t statusp, int options, int *retval)
 
   *retval = -1;
 
-  if(pid < 0 || pid > MAX_PROC + 1)
+  if(pid <= 0 || pid > MAX_PROC + 1)
     return ESRCH;
   
   if(options != 0)
     return EINVAL;
 
 #if OPT_WAITPID
+  
   struct proc *p = proc_search_pid(pid);
 
-  if(p == NULL)
+  if(p == NULL) {
     return ESRCH;
+  }
+  
+  if(curproc == NULL) {
+    panic("curproc is NULL in sys_waitpid!\n");
+  }
 
-  if(p == curproc)
-    return EPERM;
+  if(p == curproc) {
+    return EINVAL;
+  }
 
-  if(p == curproc->parent)
-    return EPERM;
-
-  if(p->parent != curproc)
+  
+  if(p->parent == NULL) {
     return ECHILD;
-
+  }
+  
+  // ⭐ Questo potrebbe crashare se curproc è corrotto
+  if(p->parent != curproc) {
+    return ECHILD;
+  }
+  
   s = proc_wait(p);
+
+  s = _MKWAIT_EXIT(s);
 
   if (statusp!=NULL) {
     result = copyout(&s, statusp, sizeof(int));
@@ -82,7 +102,7 @@ sys_waitpid(pid_t pid, userptr_t statusp, int options, int *retval)
   *retval = pid;
   return 0;
 #else
-  (void)options; /* not handled */
+  (void)options;
   (void)pid;
   (void)statusp;
   return -1;
@@ -171,6 +191,7 @@ int sys_execv(const char *program, char **args)
   char *kprogname;
   struct vnode *v;
   struct addrspace *as;
+  struct addrspace *old_as;
   vaddr_t entrypoint, stackptr;
 
 
@@ -180,21 +201,43 @@ int sys_execv(const char *program, char **args)
   
 
   /* Count arguments */
-  for(i=0; args[i]!=NULL; i++);
+  for(i = 0; i < ARG_MAX; i++) {
+    char *arg_ptr;
+    result = copyin((const_userptr_t)(args + i), &arg_ptr, sizeof(char *));
+    if(result) {
+      return result;
+    }
+    if(arg_ptr == NULL) {
+      break;
+    }
+  }
 
-  KASSERT(args[i] == NULL);
   if(i >= ARG_MAX) {
     return E2BIG;
   }
 
-  kargs = (char **) kmalloc(sizeof(char *) * i);
+  kargs = (char **) kmalloc(sizeof(char *) * (i+1));
   if(kargs == NULL) {
     return ENOMEM;
   }
 
   /* Copy arguments */
+  argc = 0;
   i = 0;
-  while(args[i] != NULL) {
+  while(1) {
+    char *arg_ptr;
+    
+    result = copyin((const_userptr_t)(args + i), &arg_ptr, sizeof(char *));
+    if(result) {
+      for(int j = 0; j < i; j++) kfree(kargs[j]);
+      kfree(kargs);
+      return result;
+    }
+    
+    if(arg_ptr == NULL) {
+      break; 
+    }
+    
     kargs[i] = kmalloc(ARG_MAX);
     if(kargs[i] == NULL) {
       for(int j = 0; j < i; j++) kfree(kargs[j]);
@@ -202,7 +245,7 @@ int sys_execv(const char *program, char **args)
       return ENOMEM;
     }
 
-    result = copyinstr((userptr_t)args[i], kargs[i], ARG_MAX, NULL);
+    result = copyinstr((userptr_t)arg_ptr, kargs[i], ARG_MAX, NULL);
     if(result) {
       for(int j = 0; j <= i; j++) kfree(kargs[j]);
       kfree(kargs);
@@ -230,6 +273,14 @@ int sys_execv(const char *program, char **args)
     return result;
   }
 
+  /* Check for empty program name */
+  if(strlen(kprogname) == 0) {
+    for(i = 0; i < argc; i++) kfree(kargs[i]);
+    kfree(kargs);
+    kfree(kprogname);
+    return EINVAL;
+  }
+
   /* Open file */
   result = vfs_open(kprogname, O_RDONLY, 0, &v);
   if (result) {
@@ -240,8 +291,7 @@ int sys_execv(const char *program, char **args)
   }
 
   /* Replace address space */ 
-  proc_setas(NULL);
-  KASSERT(proc_getas() == NULL);
+  old_as = proc_getas();
 
   as = as_create();
   if (as == NULL) {
@@ -258,6 +308,9 @@ int sys_execv(const char *program, char **args)
   /* Load ELF */
   result = load_elf(v, &entrypoint);
   if (result) {
+    proc_setas(old_as);
+    as_activate();
+    as_destroy(as);
     vfs_close(v);
     for(i = 0; i < argc; i++) kfree(kargs[i]);
     kfree(kargs);
@@ -266,9 +319,13 @@ int sys_execv(const char *program, char **args)
   }
   vfs_close(v);
 
+
   /* Set up stack */
   result = as_define_stack(as, &stackptr);
   if (result) {
+    proc_setas(old_as);  // ⭐ AGGIUNGI: ripristina old_as
+    as_activate();        // ⭐ AGGIUNGI: attiva old_as
+    as_destroy(as);       // ⭐ AGGIUNGI: distruggi nuovo AS
     for(i = 0; i < argc; i++) kfree(kargs[i]);
     kfree(kargs);
     kfree(kprogname);
@@ -276,8 +333,11 @@ int sys_execv(const char *program, char **args)
   }
 
   /* Copy arguments to user stack */
-  uargs = (char **)kmalloc(sizeof(char *) * argc);
+  uargs = (char **)kmalloc(sizeof(char *) * (argc + 1));
   if(uargs == NULL) {
+    proc_setas(old_as);  // ⭐ AGGIUNGI: ripristina old_as
+    as_activate();        // ⭐ AGGIUNGI: attiva old_as
+    as_destroy(as);       // ⭐ AGGIUNGI: distruggi nuovo AS
     for(i = 0; i < argc; i++) kfree(kargs[i]);
     kfree(kargs);
     kfree(kprogname);
@@ -288,11 +348,13 @@ int sys_execv(const char *program, char **args)
   for(i = 0; i < argc; i++) {
     arglen = strlen(kargs[i]) + 1;
     stackptr -= arglen;
-    if(stackptr & 0x3)
-      stackptr -= (stackptr & 0x3);
+    stackptr &= ~0x3;
 
     result = copyoutstr(kargs[i], (userptr_t)stackptr, arglen, NULL);
     if(result) {
+      proc_setas(old_as);  // ⭐ AGGIUNGI: ripristina old_as
+      as_activate();        // ⭐ AGGIUNGI: attiva old_as
+      as_destroy(as);       // ⭐ AGGIUNGI: distruggi nuovo AS
       for(int j = 0; j < argc; j++) kfree(kargs[j]);
       kfree(kargs);
       kfree(kprogname);
@@ -304,15 +366,21 @@ int sys_execv(const char *program, char **args)
 
   /* Copy argv array */
   stackptr -= sizeof(char *) * (argc + 1);
+  stackptr &= ~0x7;
 
-  result = copyout(uargs, (userptr_t)stackptr, sizeof(char *) * argc);
+  result = copyout(uargs, (userptr_t)stackptr, sizeof(char *) * (argc + 1 ));
   if(result) {
+    proc_setas(old_as);  // ⭐ AGGIUNGI: ripristina old_as
+    as_activate();        // ⭐ AGGIUNGI: attiva old_as
+    as_destroy(as);       // ⭐ AGGIUNGI: distruggi nuovo AS
     for(i = 0; i < argc; i++) kfree(kargs[i]);
     kfree(kargs);
     kfree(kprogname);
     kfree(uargs);
     return result;
   }
+
+  as_destroy(old_as);
 
   /* Cleanup */
   for(i = 0; i < argc; i++) kfree(kargs[i]);
