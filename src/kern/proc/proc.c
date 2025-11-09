@@ -569,6 +569,7 @@ void
 proc_file_table_copy(struct proc *psrc, struct proc *pdest) {
   int fd;
 
+  kprintf("[FTCOPY] PID=%d -> PID=%d\n", psrc->p_pid, pdest->p_pid);
   spinlock_acquire(&psrc->p_lock);
   for (fd=0; fd<OPEN_MAX; fd++) {
     struct openfile *of = psrc->fileTable[fd];
@@ -576,6 +577,7 @@ proc_file_table_copy(struct proc *psrc, struct proc *pdest) {
     if (of != NULL) {
       /* incr reference count */
       openfileIncrRefCount(of);
+		kprintf("[FTCOPY] fd=%d of=%p ref=%d\n", fd, (void*)of, of->countRef);
     }
   }
   spinlock_release(&psrc->p_lock);

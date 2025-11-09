@@ -392,6 +392,8 @@ sys_open(userptr_t path, int openflags, mode_t mode, int *errp)
   struct stat statbuf;
   int result;
 
+  kprintf("[OPEN] PID=%d enter\n", curproc ? curproc->p_pid : -1);
+
   if(path == NULL) {
     *errp = EFAULT;
     return -1;
@@ -429,12 +431,16 @@ sys_open(userptr_t path, int openflags, mode_t mode, int *errp)
     return -1;
   }
 
+  kprintf("[OPEN] PID=%d opening '%s' flags=0x%x\n", 
+          curproc->p_pid, kbuf, openflags);
+
   /* vfs_open: 
    * - Resolves pathname (handles /, .., symlinks, etc.)
    * - Opens/creates the file based on openflags
    * - Returns a vnode (Virtual Node - represents the file) */
   result = vfs_open(kbuf, openflags, mode, &v);
   if(result) {
+    kprintf("[OPEN] PID=%d vfs_open failed: err=%d\n", curproc->p_pid, result);
     kfree(kbuf);
     *errp = result;
     return -1;
@@ -475,6 +481,7 @@ sys_open(userptr_t path, int openflags, mode_t mode, int *errp)
     if(curproc->fileTable[fd] == NULL) {
       curproc->fileTable[fd] = of;
       spinlock_release(&curproc->fileTable_spinlock);
+      kprintf("[OPEN] PID=%d success: fd=%d '%s'\n", curproc->p_pid, fd, kbuf);
       kfree(kbuf); 
       return fd;
     }
@@ -642,10 +649,13 @@ sys_read(int fd, userptr_t buf_ptr, size_t size, int *retval)
    * use the full VFS-based file I/O system */  
   if (fd!=STDIN_FILENO) {
 #if OPT_FILE
-    return file_read(fd, buf_ptr, size, retval);
+  kprintf("[READ] PID=%d fd=%d size=%zu\n", curproc->p_pid, fd, size);
+  return file_read(fd, buf_ptr, size, retval);
+  kprintf("[READ] PID=%d fd=%d done: retval=%d err=%d\n", 
+            curproc->p_pid, fd, *retval, result);
 #else
-    kprintf("sys_read supported only to stdin\n");
-    return EINVAL;
+  kprintf("sys_read supported only to stdin\n");
+  return EINVAL;
 #endif
   }
 
@@ -708,6 +718,9 @@ sys_lseek(int fd, off_t pos, int whence, int32_t *retval, int32_t *retval2)
   off_t new_offset;
   struct stat statbuf;
   int result;
+
+  kprintf("[LSEEK] PID=%d fd=%d pos=%lld whence=%d\n", 
+          curproc->p_pid, fd, pos, whence);
 
   *retval = -1;
 
@@ -779,6 +792,9 @@ sys_lseek(int fd, off_t pos, int whence, int32_t *retval, int32_t *retval2)
 
   of->offset = new_offset;
   spinlock_release(&curproc->fileTable_spinlock);
+
+  kprintf("[LSEEK] PID=%d fd=%d new_offset=%lld\n", 
+          curproc->p_pid, fd, new_offset);
 
   *retval = (int32_t)(new_offset >> 32); /* most significant bits */
   *retval2 = (int32_t)(new_offset & 0x00000000FFFFFFFF); /* least significant bits */

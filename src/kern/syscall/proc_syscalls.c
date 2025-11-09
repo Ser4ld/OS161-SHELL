@@ -59,14 +59,16 @@ sys_waitpid(pid_t pid, userptr_t statusp, int options, int *retval)
 {
   int result;
   int s;
-
   *retval = -1;
 
-  if(pid <= 0 || pid > MAX_PROC + 1)
+  if(pid <= 0 || pid > MAX_PROC + 1){
     return ESRCH;
+  }
+    
   
-  if(options != 0)
+  if(options != 0){
     return EINVAL;
+  }
 
 #if OPT_WAITPID
   
@@ -90,6 +92,8 @@ sys_waitpid(pid_t pid, userptr_t statusp, int options, int *retval)
   }
   
   if(p->parent != curproc) {
+    kprintf("[WAITPID-SIBLING] curproc=%d trying to wait for pid=%d (parent=%d)\n", 
+            curproc->p_pid, pid, p->parent->p_pid);
     return ECHILD;
   }
  
@@ -98,8 +102,10 @@ sys_waitpid(pid_t pid, userptr_t statusp, int options, int *retval)
 
   if (statusp!=NULL) {
     result = copyout(&s, statusp, sizeof(int));
-    if(result)
+    if(result){
       return result;
+    }
+      
   }
 
   *retval = pid;
@@ -153,10 +159,12 @@ int sys_fork(struct trapframe *ctf, pid_t *retval) {
   KASSERT(curproc != NULL);
   KASSERT(curproc->p_pid < MAX_PROC);
 
+
   newp = proc_create_runprogram(curproc->p_name);
   if (newp == NULL) {
     return ENOMEM;
   }
+
 
 #if OPT_FILE
   proc_addChild(curproc, newp->p_pid);
@@ -180,7 +188,6 @@ int sys_fork(struct trapframe *ctf, pid_t *retval) {
 
   
   newp->parent = curproc;
-
   result = thread_fork(
 		 curthread->t_name, newp,
 		 call_enter_forked_process, 
