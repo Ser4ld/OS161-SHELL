@@ -92,8 +92,6 @@ sys_waitpid(pid_t pid, userptr_t statusp, int options, int *retval)
   }
   
   if(p->parent != curproc) {
-    kprintf("[WAITPID-SIBLING] curproc=%d trying to wait for pid=%d (parent=%d)\n", 
-            curproc->p_pid, pid, p->parent->p_pid);
     return ECHILD;
   }
  
@@ -165,6 +163,8 @@ int sys_fork(struct trapframe *ctf, pid_t *retval) {
     return ENOMEM;
   }
 
+  newp->parent = curproc;
+
 
 #if OPT_FILE
   proc_addChild(curproc, newp->p_pid);
@@ -187,7 +187,6 @@ int sys_fork(struct trapframe *ctf, pid_t *retval) {
   memcpy(tf_child, ctf, sizeof(struct trapframe));
 
   
-  newp->parent = curproc;
   result = thread_fork(
 		 curthread->t_name, newp,
 		 call_enter_forked_process, 
@@ -361,9 +360,9 @@ int sys_execv(const char *program, char **args)
   /* Set up stack */
   result = as_define_stack(as, &stackptr);
   if (result) {
-    proc_setas(old_as);  // ⭐ AGGIUNGI: ripristina old_as
-    as_activate();        // ⭐ AGGIUNGI: attiva old_as
-    as_destroy(as);       // ⭐ AGGIUNGI: distruggi nuovo AS
+    proc_setas(old_as);
+    as_activate();
+    as_destroy(as);
     for(i = 0; i < argc; i++) kfree(kargs[i]);
     kfree(kargs);
     kfree(kprogname);
@@ -373,9 +372,9 @@ int sys_execv(const char *program, char **args)
   /* Copy arguments to user stack */
   uargs = (char **)kmalloc(sizeof(char *) * (argc + 1));
   if(uargs == NULL) {
-    proc_setas(old_as);  // ⭐ AGGIUNGI: ripristina old_as
-    as_activate();        // ⭐ AGGIUNGI: attiva old_as
-    as_destroy(as);       // ⭐ AGGIUNGI: distruggi nuovo AS
+    proc_setas(old_as);
+    as_activate();
+    as_destroy(as);
     for(i = 0; i < argc; i++) kfree(kargs[i]);
     kfree(kargs);
     kfree(kprogname);
@@ -390,9 +389,9 @@ int sys_execv(const char *program, char **args)
 
     result = copyoutstr(kargs[i], (userptr_t)stackptr, arglen, NULL);
     if(result) {
-      proc_setas(old_as);  // ⭐ AGGIUNGI: ripristina old_as
-      as_activate();        // ⭐ AGGIUNGI: attiva old_as
-      as_destroy(as);       // ⭐ AGGIUNGI: distruggi nuovo AS
+      proc_setas(old_as);
+      as_activate();
+      as_destroy(as);
       for(int j = 0; j < argc; j++) kfree(kargs[j]);
       kfree(kargs);
       kfree(kprogname);
@@ -408,9 +407,9 @@ int sys_execv(const char *program, char **args)
 
   result = copyout(uargs, (userptr_t)stackptr, sizeof(char *) * (argc + 1 ));
   if(result) {
-    proc_setas(old_as);  // ⭐ AGGIUNGI: ripristina old_as
-    as_activate();        // ⭐ AGGIUNGI: attiva old_as
-    as_destroy(as);       // ⭐ AGGIUNGI: distruggi nuovo AS
+    proc_setas(old_as);
+    as_activate();
+    as_destroy(as);
     for(i = 0; i < argc; i++) kfree(kargs[i]);
     kfree(kargs);
     kfree(kprogname);

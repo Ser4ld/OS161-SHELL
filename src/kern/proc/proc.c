@@ -120,6 +120,7 @@ proc_init_waitpid(struct proc *proc, const char *name) {
   }
   proc->p_status = 0;
   proc->terminated = false;
+  proc->parent = NULL;  /* Will be set by sys_fork if created via fork */
 
   proc->children = array_create();
 #if USE_SEMAPHORE_FOR_WAITPID
@@ -363,42 +364,61 @@ proc_create_runprogram(const char *name)
 int 
 console_initialization(const char *lockname, struct proc *p, int fd, int openflags)
 {
-	struct vnode *console_vn;
-	struct openfile *of = NULL;
-	char console_path[] = "con:";
-	int result, sft_index;
-	
-	(void)lockname;
+    struct vnode *console_vn;
+    struct openfile *of = NULL;
+    char console_path[] = "con:";
+    int result, sft_index;
 
-	result = vfs_open(console_path, openflags, 0, &console_vn);
-	if (result) {
-		return result;
-	}
+    result = vfs_open(console_path, openflags, 0, &console_vn);
+    if (result) {
+        return result;
+    }
 
-	spinlock_acquire(&systemFileTable_spinlock);
-	for (sft_index = 0; sft_index < SYSTEM_OPEN_MAX; sft_index++) {
-		if (systemFileTable[sft_index].vn == NULL) {
-			systemFileTable[sft_index].vn = console_vn;
-			systemFileTable[sft_index].offset = 0;
-			systemFileTable[sft_index].countRef = 1;
-			systemFileTable[sft_index].openflags = openflags;
-			of = &systemFileTable[sft_index];
-			break;
-		}
-	}
-	spinlock_release(&systemFileTable_spinlock);
+    spinlock_acquire(&systemFileTable_spinlock);
+    
+    for (sft_index = 0; sft_index < SYSTEM_OPEN_MAX; sft_index++) {
+        if (systemFileTable[sft_index].vn == NULL) {
+            of = &systemFileTable[sft_index];
+            
+            /* Mark as in-use with sentinel value */
+            of->vn = (struct vnode *)1;
+            break;
+        }
+    }
+    
+    spinlock_release(&systemFileTable_spinlock);
 
-	if (of == NULL) {  /* ← Controlla of invece di sft_index (più chiaro) */
-		vfs_close(console_vn);
-		return ENFILE;
-	}
+    if (of == NULL) {
+        vfs_close(console_vn);
+        return ENFILE;
+    }
 
+    /* Create lock for this openfile (OUTSIDE spinlock!) */
+    of->of_lock = lock_create(lockname);
+    if (of->of_lock == NULL) {
+        spinlock_acquire(&systemFileTable_spinlock);
+        of->vn = NULL;
+        spinlock_release(&systemFileTable_spinlock);
+        vfs_close(console_vn);
+        return ENOMEM;
+    }
 
-	spinlock_acquire(&p->fileTable_spinlock);
-	p->fileTable[fd] = of;
-	spinlock_release(&p->fileTable_spinlock);
+    /* Initialize openfile fields */
+    lock_acquire(of->of_lock);
+    
+    of->vn = console_vn;  /* Replace sentinel value */
+    of->offset = 0;
+    of->countRef = 1;
+    of->openflags = openflags;
+    
+    lock_release(of->of_lock);
 
-	return 0;
+    /* Add to process file table */
+    spinlock_acquire(&p->fileTable_spinlock);
+    p->fileTable[fd] = of;
+    spinlock_release(&p->fileTable_spinlock);
+
+    return 0;
 }
 #endif
 
@@ -540,9 +560,9 @@ proc_signal_end(struct proc *proc)
 #if USE_SEMAPHORE_FOR_WAITPID
       V(proc->p_sem);
 #else
-      lock_acquire(proc->p_lock);
+      lock_acquire(proc->p_waitlock);
       cv_signal(proc->p_cv);
-      lock_release(proc->p_lock);
+      lock_release(proc->p_waitlock);
 #endif
 }
 
@@ -550,8 +570,10 @@ proc_signal_end(struct proc *proc)
 void
 proc_addChild(struct proc *parent, pid_t child_pid)
 {
-	pid_t *temp = (pid_t *)kmalloc(sizeof(pid_t));
+	pid_t *temp;
+	int result;
 
+	temp = (pid_t *)kmalloc(sizeof(pid_t));
 	if (temp == NULL) {
 		panic("proc_addChild: out of memory");
     }
@@ -559,8 +581,13 @@ proc_addChild(struct proc *parent, pid_t child_pid)
 	*temp = child_pid;
 
 	spinlock_acquire(&parent->p_lock);
-	array_add(parent->children, (void *)temp, NULL);
+	result = array_add(parent->children, (void *)temp, NULL);
 	spinlock_release(&parent->p_lock);
+
+	if (result) {
+    kfree(temp);
+    panic("proc_addChild: array_add failed");
+  }
 }
 #endif
 
@@ -569,17 +596,26 @@ void
 proc_file_table_copy(struct proc *psrc, struct proc *pdest) {
   int fd;
 
-  kprintf("[FTCOPY] PID=%d -> PID=%d\n", psrc->p_pid, pdest->p_pid);
-  spinlock_acquire(&psrc->p_lock);
-  for (fd=0; fd<OPEN_MAX; fd++) {
-    struct openfile *of = psrc->fileTable[fd];
-    pdest->fileTable[fd] = of;
+  for (fd = 0; fd < OPEN_MAX; fd++) {
+    struct openfile *of;
+
+    /* Leggi il puntatore dal padre.
+       Con OS/161 (un solo thread per processo) lo spinlock sulla fileTable
+       è quasi superfluo, ma lo teniamo per coerenza con il resto del codice. */
+    spinlock_acquire(&psrc->fileTable_spinlock);
+    of = psrc->fileTable[fd];
     if (of != NULL) {
-      /* incr reference count */
-      openfileIncrRefCount(of);
-		kprintf("[FTCOPY] fd=%d of=%p ref=%d\n", fd, (void*)of, of->countRef);
+      pdest->fileTable[fd] = of;
+    } else {
+      pdest->fileTable[fd] = NULL;
+    }
+    spinlock_release(&psrc->fileTable_spinlock);
+
+    if (of != NULL) {
+      lock_acquire(of->of_lock);
+      of->countRef++;
+      lock_release(of->of_lock);
     }
   }
-  spinlock_release(&psrc->p_lock);
 }
 #endif

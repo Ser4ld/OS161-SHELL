@@ -17,6 +17,7 @@
 #include <kern/seek.h>
 #include <kern/stat.h>
 #include <kern/fcntl.h>
+#include <synch.h>
 
 #define USE_KERNEL_BUFFER 0
 
@@ -24,8 +25,11 @@ struct openfile systemFileTable[SYSTEM_OPEN_MAX];
 struct spinlock systemFileTable_spinlock = SPINLOCK_INITIALIZER;
 
 void openfileIncrRefCount(struct openfile *of) {
-  if (of!=NULL)
+  if (of != NULL) {
+    lock_acquire(of->of_lock);
     of->countRef++;
+    lock_release(of->of_lock);
+  }
 }
 
 
@@ -54,6 +58,7 @@ file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
   struct vnode *vn;
   struct openfile *of;
   void *kbuf;
+  off_t offset;
 
   if (fd < 0 || fd >= OPEN_MAX)
     return EBADF;
@@ -76,21 +81,28 @@ file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
     return EBADF;
   }
 
+  spinlock_release(&curproc->fileTable_spinlock);
+
+  spinlock_acquire(&of->of_lock);
+
   /* Check permission (O_WRONLY not allowed) */ 
   if ((of->openflags & O_ACCMODE) == O_WRONLY) {
-    spinlock_release(&curproc->fileTable_spinlock);
+    spinlock_release(&of->of_lock);
     return EBADF;
   }
+
+  offset = of->offset;
+
+  spinlock_release(&of->of_lock);
 
   /* Allocate kernel buffer for read */
   kbuf = kmalloc(size);
   if (kbuf == NULL) { 
-    spinlock_release(&curproc->fileTable_spinlock);
     return ENOMEM;
   }
 
   /* Setup kernel space UIO for read */
-  uio_kinit(&iov, &ku, kbuf, size, of->offset, UIO_READ);
+  uio_kinit(&iov, &ku, kbuf, size, offset, UIO_READ);
 
   spinlock_release(&curproc->fileTable_spinlock);
 
@@ -245,9 +257,13 @@ file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
     return EBADF;
   }
 
+  spinlock_release(&curproc->fileTable_spinlock);
+
+  lock_acquire(of->of_lock);
+
   /* Check permission (O_WRONLY not allowed) */
   if ((of->openflags & O_ACCMODE) == O_WRONLY) {
-    spinlock_release(&curproc->fileTable_spinlock);
+    lock_release(of->of_lock);
     return EBADF; 
   }
 
@@ -270,18 +286,17 @@ file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
   u.uio_rw = UIO_READ;
   u.uio_space = curproc->p_addrspace;
 
-  spinlock_release(&curproc->fileTable_spinlock);
-
   /* Perform read via VFS */
   result = VOP_READ(vn, &u);
   if (result) {
+    lock_release(of->of_lock);
     return result;
   }
 
   /* Update file offset */
-  spinlock_acquire(&curproc->fileTable_spinlock);
+
   of->offset = u.uio_offset;
-  spinlock_release(&curproc->fileTable_spinlock);
+  lock_release(of->of_lock);
 
   *retval = (size - u.uio_resid);
   return 0;
@@ -327,8 +342,12 @@ file_write(int fd, userptr_t buf_ptr, size_t size, int *retval) {
     return EBADF;
   }
 
+  spinlock_release(&curproc->fileTable_spinlock);
+
+  lock_acquire(of->of_lock);
+
   if ((of->openflags & O_ACCMODE) == O_RDONLY) {
-    spinlock_release(&curproc->fileTable_spinlock);
+    lock_release(of->of_lock);
     return EBADF;  /* File aperto solo per lettura */
   }
 
@@ -343,18 +362,17 @@ file_write(int fd, userptr_t buf_ptr, size_t size, int *retval) {
   u.uio_rw = UIO_WRITE;
   u.uio_space = curproc->p_addrspace;
 
-  spinlock_release(&curproc->fileTable_spinlock);
   result = VOP_WRITE(vn, &u);
   if (result) {
+    lock_release(of->of_lock);
     return result;
   }
 
-  spinlock_acquire(&curproc->fileTable_spinlock);
   of->offset = u.uio_offset;
-  spinlock_release(&curproc->fileTable_spinlock);
+
+  lock_release(of->of_lock);
 
   nwrite = size - u.uio_resid;
-
   *retval = nwrite;
   return 0;
 }
@@ -392,114 +410,129 @@ sys_open(userptr_t path, int openflags, mode_t mode, int *errp)
   struct stat statbuf;
   int result;
 
-  kprintf("[OPEN] PID=%d enter\n", curproc ? curproc->p_pid : -1);
-
-  if(path == NULL) {
+  if (path == NULL) {
     *errp = EFAULT;
     return -1;
   }
 
-  /* O_ACCMODE is a mask (0x3) that extracts the access mode bits.
-   * Valid values: O_RDONLY (0), O_WRONLY (1), O_RDWR (2) */
-  if((openflags & O_ACCMODE) != O_RDONLY && 
-     (openflags & O_ACCMODE) != O_WRONLY && 
-     (openflags & O_ACCMODE) != O_RDWR) {
+  /* Controllo modalità di apertura */
+  if ((openflags & O_ACCMODE) != O_RDONLY && 
+      (openflags & O_ACCMODE) != O_WRONLY && 
+      (openflags & O_ACCMODE) != O_RDWR) {
     *errp = EINVAL;
     return -1;
   }
 
-  /* Allocate kern buffer for pathname
-   * No userspace pointer in kernel */
+  /* Buffer kernel per il pathname */
   kbuf = (char *)kmalloc(PATH_MAX);
-  if(kbuf == NULL) {
+  if (kbuf == NULL) {
     *errp = ENOMEM;
     return -1;
   }
 
-  /* copyinstr: safely copy string from userspace to kernel */
+  /* Copia sicura da userspace */
   result = copyinstr(path, kbuf, PATH_MAX, NULL);
-  if(result) {
+  if (result) {
     kfree(kbuf);
     *errp = result;
     return -1;
   }
 
-  /* Check for empty pathname */
-  if(strlen(kbuf) == 0) {
+  if (strlen(kbuf) == 0) {
     kfree(kbuf);
     *errp = EINVAL;
     return -1;
   }
 
-  kprintf("[OPEN] PID=%d opening '%s' flags=0x%x\n", 
-          curproc->p_pid, kbuf, openflags);
-
-  /* vfs_open: 
-   * - Resolves pathname (handles /, .., symlinks, etc.)
-   * - Opens/creates the file based on openflags
-   * - Returns a vnode (Virtual Node - represents the file) */
+  /* vfs_open: risolve il path e apre il file */
   result = vfs_open(kbuf, openflags, mode, &v);
-  if(result) {
-    kprintf("[OPEN] PID=%d vfs_open failed: err=%d\n", curproc->p_pid, result);
-    kfree(kbuf);
+  kfree(kbuf);
+
+  if (result) {
     *errp = result;
     return -1;
   }
 
-  /* find free slot in SYSTEM file table */
-  for(i = 0; i < SYSTEM_OPEN_MAX; i++) {
-    if(systemFileTable[i].vn == NULL) {
+  /* Trova uno slot libero nella system file table */
+  spinlock_acquire(&systemFileTable_spinlock);
+
+  for (i = 0; i < SYSTEM_OPEN_MAX; i++) {
+    if (systemFileTable[i].vn == NULL) {
       of = &systemFileTable[i];
-      of->vn = v;
-      of->offset = 0;
-      of->countRef = 1;
-      of->openflags = openflags;
+      /* segnalino "occupato in init", per evitare reuse concorrente */
+      of->vn = (struct vnode *)1;
       break;
     }
   }
 
-  /* system file table is full */
-  if(of == NULL) { 
-    vfs_close(v); /* Close the vnode we just opened */
-    kfree(kbuf);
+  spinlock_release(&systemFileTable_spinlock);
+
+  /* nessuno slot libero */
+  if (of == NULL) {
+    vfs_close(v);
     *errp = ENFILE;
     return -1;
   }
 
-  /* permission O_APPEND 
-   * set initial offset to file size */
-  if((openflags & O_APPEND) == O_APPEND) {
-    VOP_STAT(of->vn, &statbuf);
+  /* Crea la lock dell'openfile */
+  of->of_lock = lock_create("openfile_lock");
+  if (of->of_lock == NULL) {
+    spinlock_acquire(&systemFileTable_spinlock);
+    of->vn = NULL;
+    spinlock_release(&systemFileTable_spinlock);
+    vfs_close(v);
+    *errp = ENOMEM;
+    return -1;
+  }
+
+  /* Inizializza l'openfile sotto il suo lock */
+  lock_acquire(of->of_lock);
+
+  of->vn = v;          /* sostituisce la sentinella */
+  of->offset = 0;
+  of->countRef = 1;
+  of->openflags = openflags;
+
+  /* Gestione O_APPEND: offset iniziale = file size */
+  if ((openflags & O_APPEND) == O_APPEND) {
+    result = VOP_STAT(of->vn, &statbuf);
+    if (result) {
+      of->vn = NULL;
+      lock_release(of->of_lock);
+      lock_destroy(of->of_lock);
+      vfs_close(v);
+      *errp = result;
+      return -1;
+    }
     of->offset = statbuf.st_size;
   }
 
-  /* Each process has its own file descriptor table [0..OPEN_MAX-1]
-   * fd 0 = stdin, fd 1 = stdout, fd 2 = stderr
-   * We start searching from fd 3 */
+  lock_release(of->of_lock);
+
+  /* Inserisci of nella fileTable del processo */
   spinlock_acquire(&curproc->fileTable_spinlock);
-  for(fd = STDERR_FILENO + 1; fd < OPEN_MAX; fd++) {
-    if(curproc->fileTable[fd] == NULL) {
+  for (fd = STDERR_FILENO + 1; fd < OPEN_MAX; fd++) {
+    if (curproc->fileTable[fd] == NULL) {
       curproc->fileTable[fd] = of;
       spinlock_release(&curproc->fileTable_spinlock);
-      kprintf("[OPEN] PID=%d success: fd=%d '%s'\n", curproc->p_pid, fd, kbuf);
-      kfree(kbuf); 
       return fd;
     }
   }
-
-  /* No free fd in this process's file table */
   spinlock_release(&curproc->fileTable_spinlock);
-  
-  /* Cleanup: 
-   * 1 Remove entry from system file table
-   * 2 Close the vnode (release filesystem resources)
-   * 3 Free the kernel buffer */
+
+  /* Nessun fd libero nel processo: pulizia */
+  lock_acquire(of->of_lock);
   of->vn = NULL;
+  of->countRef = 0;
+  lock_release(of->of_lock);
+
+  lock_destroy(of->of_lock);
   vfs_close(v);
-  kfree(kbuf);
+
   *errp = EMFILE;
   return -1;
 }
+
 
 /*
  * sys_close - Close a file descriptor
@@ -514,44 +547,58 @@ sys_open(userptr_t path, int openflags, mode_t mode, int *errp)
 int
 sys_close(int fd)
 {
-  struct openfile *of=NULL; 
-  struct vnode *vn;
+  struct openfile *of = NULL; 
+  struct vnode *vn = NULL;
+  struct lock *lock_to_destroy = NULL;
 
-  if (fd < 0 || fd >= OPEN_MAX) 
+  /* Controllo fd */
+  if (fd < 0 || fd >= OPEN_MAX) {
     return EBADF;
-  
+  }
+
+  /* 1. Stacca il fd dalla file table del processo */
   spinlock_acquire(&curproc->fileTable_spinlock);
 
-  /* get openfile entry from process file table */
   of = curproc->fileTable[fd];
   if (of == NULL) {
     spinlock_release(&curproc->fileTable_spinlock);
     return EBADF;
   }
 
-  /* get vnode and check validity */ 
-  vn = of->vn;
-  if (vn == NULL) {
-    spinlock_release(&curproc->fileTable_spinlock);
+  curproc->fileTable[fd] = NULL;
+
+  spinlock_release(&curproc->fileTable_spinlock);
+
+  /* 2. Lavora sull'openfile sotto il suo lock */
+  lock_acquire(of->of_lock);
+
+  /* Se nel frattempo qualcuno ha "svuotato" l'openfile, tratti come EBADF */
+  if (of->vn == NULL) {
+    lock_release(of->of_lock);
     return EBADF;
   }
 
+  vn = of->vn;
+
   KASSERT(of->countRef > 0);
 
-  /* remove fd enry from the process file table */
-  curproc->fileTable[fd] = NULL;
+  of->countRef--;
 
-  /* decrement refernce count. If > 0, other processes or other fds are using this file */
-  if (--of->countRef > 0) { 
-    spinlock_release(&curproc->fileTable_spinlock);
+  if (of->countRef > 0) {
+    /* altri riferimenti (altri fd/processi) usano ancora questo file */
+    lock_release(of->of_lock);
     return 0;
   }
 
-  /* countref = 0 - no process is using this file anymore (system File Table entry free) */ 
-  of->vn = NULL;
-  spinlock_release(&curproc->fileTable_spinlock);
-  
+  /* 3. Ultimo riferimento: svuota l'openfile e prepara la chiusura reale */
+  of->vn = NULL;        /* da qui in poi lo slot è "logicamente" libero */
+  lock_to_destroy = of->of_lock;
+
+  lock_release(of->of_lock);
+
+  /* vfs_close chiude il vnode; nessun altro può più accedervi tramite questo of */
   vfs_close(vn);
+  lock_destroy(lock_to_destroy);
 
   return 0;
 }
@@ -649,10 +696,7 @@ sys_read(int fd, userptr_t buf_ptr, size_t size, int *retval)
    * use the full VFS-based file I/O system */  
   if (fd!=STDIN_FILENO) {
 #if OPT_FILE
-  kprintf("[READ] PID=%d fd=%d size=%zu\n", curproc->p_pid, fd, size);
   return file_read(fd, buf_ptr, size, retval);
-  kprintf("[READ] PID=%d fd=%d done: retval=%d err=%d\n", 
-            curproc->p_pid, fd, *retval, result);
 #else
   kprintf("sys_read supported only to stdin\n");
   return EINVAL;
@@ -719,9 +763,6 @@ sys_lseek(int fd, off_t pos, int whence, int32_t *retval, int32_t *retval2)
   struct stat statbuf;
   int result;
 
-  kprintf("[LSEEK] PID=%d fd=%d pos=%lld whence=%d\n", 
-          curproc->p_pid, fd, pos, whence);
-
   *retval = -1;
 
   // return EBADF if not a valid file handle
@@ -749,6 +790,8 @@ sys_lseek(int fd, off_t pos, int whence, int32_t *retval, int32_t *retval2)
     return ESPIPE;
   }
 
+  spinlock_release(&curproc->fileTable_spinlock);
+
 
   // the new position is pos
   switch (whence) {
@@ -757,44 +800,45 @@ sys_lseek(int fd, off_t pos, int whence, int32_t *retval, int32_t *retval2)
         break;
         
       case SEEK_CUR:
+        lock_acquire(of->of_lock);
+        
+        if (of->vn != vn) {
+          lock_release(of->of_lock);
+          return EBADF;
+        }
+        
         new_offset = of->offset + pos;
+        lock_release(of->of_lock);
         break;
         
       case SEEK_END:
-        spinlock_release(&curproc->fileTable_spinlock);
         
         result = VOP_STAT(vn, &statbuf);
         if (result) {
           return result;
-        }
-
-        spinlock_acquire(&curproc->fileTable_spinlock);
-        of = curproc->fileTable[fd];
-        if (of == NULL || of->vn != vn) {
-          spinlock_release(&curproc->fileTable_spinlock);
-          return EBADF;
         }
         
         new_offset = statbuf.st_size + pos;
         break;
         
       default:
-        /* Invalid whence parameter */
-        spinlock_release(&curproc->fileTable_spinlock);
         return EINVAL;
     }
 
   // seek positions less than zero are invalid
   if(new_offset < 0) {
-    spinlock_release(&curproc->fileTable_spinlock);
     return EINVAL;
   }
 
-  of->offset = new_offset;
-  spinlock_release(&curproc->fileTable_spinlock);
+  lock_acquire(of->of_lock);
+  if (of->vn != vn) {
+    lock_release(of->of_lock);
+    return EBADF;
+  }
 
-  kprintf("[LSEEK] PID=%d fd=%d new_offset=%lld\n", 
-          curproc->p_pid, fd, new_offset);
+  of->offset = new_offset;
+  lock_release(of->of_lock);
+
 
   *retval = (int32_t)(new_offset >> 32); /* most significant bits */
   *retval2 = (int32_t)(new_offset & 0x00000000FFFFFFFF); /* least significant bits */
@@ -820,6 +864,7 @@ sys_dup2(int oldfd, int newfd, int *retval)
 {
   struct openfile *old_of = NULL, *new_of = NULL;
   struct vnode *vn_to_close = NULL;
+  struct lock *lock_to_destroy = NULL;
 
   if (newfd < 0|| newfd >= OPEN_MAX)
     return EBADF;
@@ -842,24 +887,36 @@ sys_dup2(int oldfd, int newfd, int *retval)
   }
   
   new_of = curproc->fileTable[newfd];
-  if(new_of != NULL) {
-      curproc->fileTable[newfd] = NULL;
-      KASSERT(new_of->countRef > 0);
-      if (--new_of->countRef == 0) {
-        vn_to_close = new_of->vn;
-        new_of->vn = NULL;
-      }
-  }
-
   curproc->fileTable[newfd] = old_of;
-  old_of->countRef++;
-  
+
   spinlock_release(&curproc->fileTable_spinlock);
 
-  if (vn_to_close != NULL) {
-    vfs_close(vn_to_close);
-  }
+  lock_acquire(old_of->of_lock);
+  old_of->countRef++;
+  lock_release(old_of->of_lock);
+
+  if (new_of != NULL) {
+    lock_acquire(new_of->of_lock);
     
+    KASSERT(new_of->countRef > 0);
+    new_of->countRef--;
+    
+    if (new_of->countRef > 0) {
+      /* Other processes still using this file - just release and continue */
+      lock_release(new_of->of_lock);
+    } else {
+      /* countRef == 0 - we are the last one, cleanup needed */
+      vn_to_close = new_of->vn;
+      new_of->vn = NULL;
+      lock_to_destroy = new_of->of_lock;
+      
+      lock_release(new_of->of_lock);
+      
+      /* Cleanup (outside lock - vfs_close can block) */
+      vfs_close(vn_to_close);
+      lock_destroy(lock_to_destroy);
+    }
+  }
 
   *retval = newfd;
   return 0;

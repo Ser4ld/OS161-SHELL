@@ -74,7 +74,8 @@ struct openfile {
 	struct vnode *vn; 
 	off_t offset;              
 	unsigned int countRef;      
-	int openflags;              
+	int openflags;
+	struct lock *of_lock;              
 };
 
 /* System-wide open file table and its lock */

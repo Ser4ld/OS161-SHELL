@@ -14,4 +14,4 @@ file_syscalls.o: ../../syscall/file_syscalls.c ../../include/types.h \
  ../../include/vnode.h ../../include/vfs.h ../../include/uio.h \
  ../../include/kern/iovec.h ../../include/proc.h opt-waitpid.h \
  ../../include/kern/seek.h ../../include/kern/stat.h \
- ../../include/kern/fcntl.h
+ ../../include/kern/fcntl.h ../../include/synch.h opt-synch.h

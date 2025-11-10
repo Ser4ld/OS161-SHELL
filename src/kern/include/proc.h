@@ -85,16 +85,17 @@ struct proc {
 	/* add more material here as needed */
 #if OPT_WAITPID
         /* G.Cabodi - 2019 - implement waitpid: synchro, and exit status */
-        int p_status;                   /* status as obtained by exit() */
-        pid_t p_pid;                    /* process pid */
+        
+	int p_status;                   /* status as obtained by exit() */
+	pid_t p_pid;                    /* process pid */
+	struct proc *parent;
+	struct array *children;
 
-		struct proc *parent;
-		struct array *children;
 #if USE_SEMAPHORE_FOR_WAITPID
 	struct semaphore *p_sem;
 #else
-        struct cv *p_cv;
-        struct lock *p_lock;
+	struct cv *p_cv;
+	struct lock *p_waitlock;
 #endif
 #endif
 #if OPT_FILE
