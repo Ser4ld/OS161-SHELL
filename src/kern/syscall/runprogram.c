@@ -82,14 +82,12 @@ runprogram(char *progname, unsigned long argc, char **args)
 	}
 
 #if OPT_FILE
-	kprintf("RUNPROGRAM: OPT_FILE is ENABLED\n");
 	/* Initialize console for stdin/stdout/stderr if not already open */
 	if (curproc->fileTable[STDIN_FILENO] == NULL) {
 		result = console_initialization("stdin_lock", curproc, STDIN_FILENO, O_RDONLY);
 		if (result) {
 			return result;
 		}
-		kprintf("DEBUG: stdin initialized successfully\n");
 	}
 
 	if (curproc->fileTable[STDOUT_FILENO] == NULL) {
@@ -97,7 +95,6 @@ runprogram(char *progname, unsigned long argc, char **args)
 		if (result) {
 			return result;
 		}
-		kprintf("DEBUG: stdout initialized successfully\n");
 	}
 
 	if (curproc->fileTable[STDERR_FILENO] == NULL) {
@@ -105,7 +102,6 @@ runprogram(char *progname, unsigned long argc, char **args)
 		if (result) {
 			return result;
 		}
-		kprintf("DEBUG: stderr initialized successfully\n");
 	}
 #endif
 

@@ -65,43 +65,64 @@ struct vnode;
  */
 
 #if OPT_WAITPID
-/* G.Cabodi - 2019 - implement waitpid: 
-   synch with semaphore (1) or cond.var.(0) */
+/* synch with semaphore (1) or cond.var.(0) */
 #define USE_SEMAPHORE_FOR_WAITPID 1
 #endif
 
+/*
+ * struct proc - Process structure
+ *
+ * This structure represents a process in the system. It contains all the
+ * information needed to manage a process, including its threads, address
+ * space, working directory, and synchronization primitives for waitpid.
+ *
+ * Fields:
+ *   p_name        - Name of this process (for debugging)
+ *   p_lock        - Spinlock protecting this structure
+ *   p_numthreads  - Number of threads currently in this process
+ *   p_addrspace   - Virtual address space for this process
+ *   p_cwd         - Current working directory
+ *   terminated    - Flag indicating if the process has terminated
+ *   p_status      - Exit status code (set by exit(), retrieved by waitpid())
+ *   p_pid         - Process ID
+ *   parent        - Pointer to parent process structure
+ *   children      - Array of child process PIDs
+ *   p_sem         - Semaphore for waitpid synchronization (if USE_SEMAPHORE_FOR_WAITPID)
+ *   p_cv          - Condition variable for waitpid synchronization (if !USE_SEMAPHORE_FOR_WAITPID)
+ *   p_waitlock    - Lock to use with p_cv (if !USE_SEMAPHORE_FOR_WAITPID)
+ *   fileTable     - Array of open file descriptors (if OPT_FILE)
+ *   fileTable_spinlock - Lock protecting the file descriptor table (if OPT_SHELL)
+ */
 struct proc {
-	char *p_name;			/* Name of this process */
-	struct spinlock p_lock;		/* Lock for this structure */
-	unsigned p_numthreads;		/* Number of threads in this process */
-
-	/* VM */
-	struct addrspace *p_addrspace;	/* virtual address space */
-
-	/* VFS */
-	struct vnode *p_cwd;		/* current working directory */
+	char *p_name;
+	struct spinlock p_lock;
+	unsigned p_numthreads;
+	struct addrspace *p_addrspace;
+	struct vnode *p_cwd;
 	bool terminated;
 
-	/* add more material here as needed */
-#if OPT_WAITPID
-        /* G.Cabodi - 2019 - implement waitpid: synchro, and exit status */
-        
-	int p_status;                   /* status as obtained by exit() */
-	pid_t p_pid;                    /* process pid */
+#if OPT_WAITPID     
+	int p_status;
+	pid_t p_pid;
 	struct proc *parent;
 	struct array *children;
 
 #if USE_SEMAPHORE_FOR_WAITPID
 	struct semaphore *p_sem;
+
 #else
 	struct cv *p_cv;
 	struct lock *p_waitlock;
+
 #endif
 #endif
+
 #if OPT_FILE
         struct openfile *fileTable[OPEN_MAX];
+
 #if OPT_SHELL
 		struct spinlock fileTable_spinlock;
+
 #endif
 #endif
 };

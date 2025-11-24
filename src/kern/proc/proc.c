@@ -142,7 +142,7 @@ proc_init_waitpid(struct proc *proc, const char *name) {
   proc->p_sem = sem_create(name, 0);
 #else
   proc->p_cv = cv_create(name);
-  proc->p_lock = lock_create(name);
+  proc->p_waitlock = lock_create(name);
 #endif
 #else
   (void)proc;
@@ -190,7 +190,7 @@ proc_end_waitpid(struct proc *proc) {
   sem_destroy(proc->p_sem);
 #else
   cv_destroy(proc->p_cv);
-  lock_destroy(proc->p_lock);
+  lock_destroy(proc->p_waitlock);
 #endif
 #else
   (void)proc;
@@ -665,7 +665,7 @@ proc_signal_end(struct proc *proc)
       V(proc->p_sem);
 #else
       lock_acquire(proc->p_waitlock);
-      cv_signal(proc->p_cv);
+      cv_signal(proc->p_cv, proc->p_waitlock);
       lock_release(proc->p_waitlock);
 #endif
 }

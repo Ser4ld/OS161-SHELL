@@ -44,14 +44,13 @@ struct trapframe; /* from <machine/trapframe.h> */
 /*
  * The system call dispatcher.
  */
-
 void syscall(struct trapframe *tf);
 
 /*
  * Support functions.
  */
 
-/* Helper for fork(). You write this. */
+/* Helper for fork(). */
 void enter_forked_process(struct trapframe *tf);
 
 /* Enter user mode. Does not return. */
