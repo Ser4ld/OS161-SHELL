@@ -966,7 +966,6 @@ sys_chdir(const_userptr_t pathname)
   return result;
 }
 
-
 /*
  * sys___getcwd - Get current working directory pathname
  * 
