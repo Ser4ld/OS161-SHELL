@@ -1,0 +1,748 @@
+/*
+ * Copyright (c) 2013
+ *	The President and Fellows of Harvard College.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE UNIVERSITY AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE UNIVERSITY OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+/*
+ * Process support.
+ *
+ * There is (intentionally) not much here; you will need to add stuff
+ * and maybe change around what's already present.
+ *
+ * p_lock is intended to be held when manipulating the pointers in the
+ * proc structure, not while doing any significant work with the
+ * things they point to. Rearrange this (and/or change it to be a
+ * regular lock) as needed.
+ *
+ * Unless you're implementing multithreaded user processes, the only
+ * process that will have more than one thread is the kernel process.
+ */
+
+#include <types.h>
+#include <spl.h>
+#include <proc.h>
+#include <current.h>
+#include <addrspace.h>
+#include <vnode.h>
+#include <syscall.h>
+#include <vfs.h>   
+#include <kern/errno.h>    
+#include <kern/fcntl.h>
+
+#if OPT_WAITPID
+#include <synch.h>
+
+#define MAX_PROC 100
+static struct _processTable {
+  int active;           /* initial value 0 */
+  struct proc *proc[MAX_PROC+1]; /* [0] not used. pids are >= 1 */
+  int last_i;           /* index of last allocated pid */
+  struct spinlock lk;	/* Lock for this table */
+} processTable;
+
+#endif
+
+/*
+ * The process for the kernel; this holds all the kernel-only threads.
+ */
+struct proc *kproc;
+
+/*
+ * proc_search_pid - Search for a process by its PID
+ * 
+ * Arguments:
+ *   pid - process ID to search for
+ * 
+ * Returns:
+ *   Pointer to the process structure if found, NULL otherwise
+ */
+struct proc *
+proc_search_pid(pid_t pid) {
+#if OPT_WAITPID
+  struct proc *p;
+  KASSERT(pid>=0&&pid<MAX_PROC);
+  p = processTable.proc[pid];
+  if(p == NULL)
+	return NULL;
+  KASSERT(p->p_pid==pid);
+  return p;
+#else
+  (void)pid;
+  return NULL;
+#endif
+}
+
+/*
+ * proc_init_waitpid - Initialize waitpid support for a process
+ * 
+ * Allocates a PID for the process and initializes synchronization
+ * primitives (semaphore or condition variable) needed for waitpid.
+ * Uses a circular search strategy to find a free slot in the process table.
+ * 
+ * Arguments:
+ *   proc - pointer to the process to initialize
+ *   name - name for the synchronization primitives (for debugging)
+ * 
+ * Returns:
+ *   void
+ */
+static void
+proc_init_waitpid(struct proc *proc, const char *name) {
+#if OPT_WAITPID
+  int i;
+
+  spinlock_acquire(&processTable.lk);
+  i = processTable.last_i+1;
+  proc->p_pid = 0;
+  if (i>MAX_PROC) i=1;
+  while (i!=processTable.last_i) {
+    if (processTable.proc[i] == NULL) {
+      processTable.proc[i] = proc;
+      processTable.last_i = i;
+      proc->p_pid = i;
+      break;
+    }
+    i++;
+    if (i>MAX_PROC) i=1;
+  }
+  spinlock_release(&processTable.lk);
+  if (proc->p_pid==0) {
+    panic("too many processes. proc table is full\n");
+  }
+  proc->p_status = 0;
+  proc->terminated = false;
+  proc->parent = NULL;  /* Will be set by sys_fork if created via fork */
+
+  proc->children = array_create();
+#if USE_SEMAPHORE_FOR_WAITPID
+  proc->p_sem = sem_create(name, 0);
+#else
+  proc->p_cv = cv_create(name);
+  proc->p_lock = lock_create(name);
+#endif
+#else
+  (void)proc;
+  (void)name;
+#endif
+}
+
+/*
+ * proc_end_waitpid - Terminate waitpid support for a process
+ * 
+ * Removes the process from the process table and destroys all
+ * synchronization primitives and child tracking structures.
+ * 
+ * Arguments:
+ *   proc - pointer to the process to clean up
+ * 
+ * Returns:
+ *   void
+ */
+static void
+proc_end_waitpid(struct proc *proc) {
+#if OPT_WAITPID
+  int i, n;
+
+  spinlock_acquire(&processTable.lk);
+
+  i = proc->p_pid;
+
+  KASSERT(i>0 && i<=MAX_PROC);
+  processTable.proc[i] = NULL;
+
+  spinlock_release(&processTable.lk);
+
+  n = array_num(proc->children);
+
+  spinlock_acquire(&proc->p_lock);
+
+  for(i = 0; i < n; i++)
+	array_remove(proc->children, 0);
+  array_destroy(proc->children);
+
+  spinlock_release(&proc->p_lock);
+
+#if USE_SEMAPHORE_FOR_WAITPID
+  sem_destroy(proc->p_sem);
+#else
+  cv_destroy(proc->p_cv);
+  lock_destroy(proc->p_lock);
+#endif
+#else
+  (void)proc;
+#endif
+}
+
+/*
+ * proc_create - Create a new process structure
+ * 
+ * Allocates and initializes a new process structure with the given name.
+ * Initializes locks, waitpid support, and file table if enabled.
+ * 
+ * Arguments:
+ *   name - name for the process (for debugging)
+ * 
+ * Returns:
+ *   Pointer to the newly created process, or NULL on failure
+ */
+static
+struct proc *
+proc_create(const char *name)
+{
+	struct proc *proc;
+
+	proc = kmalloc(sizeof(*proc));
+	if (proc == NULL) {
+		return NULL;
+	}
+	proc->p_name = kstrdup(name);
+	if (proc->p_name == NULL) {
+		kfree(proc);
+		return NULL;
+	}
+
+	proc->p_numthreads = 0;
+	spinlock_init(&proc->p_lock);
+
+	/* VM fields */
+	proc->p_addrspace = NULL;
+
+	/* VFS fields */
+	proc->p_cwd = NULL;
+
+	proc_init_waitpid(proc,name);
+#if OPT_FILE
+        bzero(proc->fileTable,OPEN_MAX*sizeof(struct openfile *));
+#if OPT_SHELL
+		spinlock_init(&proc->fileTable_spinlock);
+#endif
+#endif
+	return proc;
+}
+
+/*
+ * proc_destroy - Destroy a process structure
+ * 
+ * Releases all resources associated with the process, including:
+ * address space, current working directory, synchronization primitives,
+ * and the process structure itself.
+ * 
+ * Arguments:
+ *   proc - pointer to the process to destroy
+ * 
+ * Returns:
+ *   void
+ */
+void
+proc_destroy(struct proc *proc)
+{
+
+	KASSERT(proc != NULL);
+	KASSERT(proc != kproc);
+
+	/* VFS fields */
+	if (proc->p_cwd) {
+		VOP_DECREF(proc->p_cwd);
+		proc->p_cwd = NULL;
+	}
+
+	/* VM fields */
+	if (proc->p_addrspace) {
+		/*
+		 * If p is the current process, remove it safely from
+		 * p_addrspace before destroying it. This makes sure
+		 * we don't try to activate the address space while
+		 * it's being destroyed.
+		 *
+		 * Also explicitly deactivate, because setting the
+		 * address space to NULL won't necessarily do that.
+		 *
+		 * (When the address space is NULL, it means the
+		 * process is kernel-only; in that case it is normally
+		 * ok if the MMU and MMU- related data structures
+		 * still refer to the address space of the last
+		 * process that had one. Then you save work if that
+		 * process is the next one to run, which isn't
+		 * uncommon. However, here we're going to destroy the
+		 * address space, so we need to make sure that nothing
+		 * in the VM system still refers to it.)
+		 *
+		 * The call to as_deactivate() must come after we
+		 * clear the address space, or a timer interrupt might
+		 * reactivate the old address space again behind our
+		 * back.
+		 *
+		 * If p is not the current process, still remove it
+		 * from p_addrspace before destroying it as a
+		 * precaution. Note that if p is not the current
+		 * process, in order to be here p must either have
+		 * never run (e.g. cleaning up after fork failed) or
+		 * have finished running and exited. It is quite
+		 * incorrect to destroy the proc structure of some
+		 * random other process while it's still running...
+		 */
+		struct addrspace *as;
+
+		if (proc == curproc) {
+			as = proc_setas(NULL);
+			as_deactivate();
+		}
+		else {
+			as = proc->p_addrspace;
+			proc->p_addrspace = NULL;
+		}
+		as_destroy(as);
+	}
+
+	KASSERT(proc->p_numthreads == 0);
+	spinlock_cleanup(&proc->p_lock);
+
+	proc_end_waitpid(proc);
+
+#if OPT_SHELL
+	spinlock_cleanup(&proc->fileTable_spinlock);
+#endif
+
+	kfree(proc->p_name);
+	kfree(proc);
+}
+
+/*
+ * proc_bootstrap - Create the kernel process structure
+ * 
+ * Initializes the kernel process (kproc) and the process table
+ * if waitpid support is enabled.
+ * 
+ * Arguments:
+ *   None
+ * 
+ * Returns:
+ *   void
+ */
+void
+proc_bootstrap(void)
+{
+	kproc = proc_create("[kernel]");
+	if (kproc == NULL) {
+		panic("proc_create for kproc failed\n");
+	}
+#if OPT_WAITPID
+	spinlock_init(&processTable.lk);
+	/* kernel process is not registered in the table */
+	processTable.active = 1;
+#endif
+}
+
+
+/*
+ * proc_create_runprogram - Create a fresh process for runprogram
+ * 
+ * Creates a new process with no address space, inheriting the current
+ * process's (kernel menu's) current working directory.
+ * 
+ * Arguments:
+ *   name - name for the new process
+ * 
+ * Returns:
+ *   Pointer to the newly created process, or NULL on failure
+ */
+struct proc *
+proc_create_runprogram(const char *name)
+{
+	struct proc *newproc;
+
+	newproc = proc_create(name);
+	if (newproc == NULL) {
+		return NULL;
+	}
+	/* VM fields */
+
+	newproc->p_addrspace = NULL;
+
+	/* VFS fields */
+
+	/*
+	 * Lock the current process to copy its current directory.
+	 * (We don't need to lock the new process, though, as we have
+	 * the only reference to it.)
+	 */
+	spinlock_acquire(&curproc->p_lock);
+	if (curproc->p_cwd != NULL) {
+		VOP_INCREF(curproc->p_cwd);
+		newproc->p_cwd = curproc->p_cwd;
+	}
+	spinlock_release(&curproc->p_lock);
+
+	return newproc;
+}
+
+#if OPT_FILE
+
+/*
+ * console_initialization - Initialize a console file descriptor
+ * 
+ * Opens the console device and adds it to both the system file table
+ * and the process's file descriptor table at the specified index.
+ * 
+ * Arguments:
+ *   lockname  - name for the openfile lock (for debugging)
+ *   p         - pointer to the process
+ *   fd        - file descriptor index (0=stdin, 1=stdout, 2=stderr)
+ *   openflags - flags for opening the console (O_RDONLY, O_WRONLY, etc.)
+ * 
+ * Returns:
+ *   0 on success, error code on failure (ENFILE if system table full,
+ *   ENOMEM if lock creation fails, or vfs_open error)
+ */
+int 
+console_initialization(const char *lockname, struct proc *p, int fd, int openflags)
+{
+    struct vnode *console_vn;
+    struct openfile *of = NULL;
+    char console_path[] = "con:";
+    int result, sft_index;
+
+    result = vfs_open(console_path, openflags, 0, &console_vn);
+    if (result) {
+        return result;
+    }
+
+    spinlock_acquire(&systemFileTable_spinlock);
+    
+    for (sft_index = 0; sft_index < SYSTEM_OPEN_MAX; sft_index++) {
+        if (systemFileTable[sft_index].vn == NULL) {
+            of = &systemFileTable[sft_index];
+            
+            /* Mark as in-use with sentinel value */
+            of->vn = (struct vnode *)1;
+            break;
+        }
+    }
+    
+    spinlock_release(&systemFileTable_spinlock);
+
+    if (of == NULL) {
+        vfs_close(console_vn);
+        return ENFILE;
+    }
+
+    /* Create lock for this openfile (OUTSIDE spinlock!) */
+    of->of_lock = lock_create(lockname);
+    if (of->of_lock == NULL) {
+        spinlock_acquire(&systemFileTable_spinlock);
+        of->vn = NULL;
+        spinlock_release(&systemFileTable_spinlock);
+        vfs_close(console_vn);
+        return ENOMEM;
+    }
+
+    /* Initialize openfile fields */
+    lock_acquire(of->of_lock);
+    
+    of->vn = console_vn;  /* Replace sentinel value */
+    of->offset = 0;
+    of->countRef = 1;
+    of->openflags = openflags;
+    
+    lock_release(of->of_lock);
+
+    /* Add to process file table */
+    spinlock_acquire(&p->fileTable_spinlock);
+    p->fileTable[fd] = of;
+    spinlock_release(&p->fileTable_spinlock);
+
+    return 0;
+}
+#endif
+
+/*
+ * proc_addthread - Add a thread to a process
+ * 
+ * Associates a thread with a process and increments the process's
+ * thread count. Disables interrupts during the association to protect
+ * against race conditions with context switches.
+ * 
+ * Arguments:
+ *   proc - pointer to the process
+ *   t    - pointer to the thread to add
+ * 
+ * Returns:
+ *   0 on success
+ */
+int
+proc_addthread(struct proc *proc, struct thread *t)
+{
+	int spl;
+
+	KASSERT(t->t_proc == NULL);
+
+	spinlock_acquire(&proc->p_lock);
+	proc->p_numthreads++;
+	spinlock_release(&proc->p_lock);
+
+	spl = splhigh();
+	t->t_proc = proc;
+	splx(spl);
+
+	return 0;
+}
+
+/*
+ * proc_remthread - Remove a thread from its process
+ * 
+ * Disassociates a thread from its process and decrements the process's
+ * thread count. Disables interrupts during the disassociation to protect
+ * against race conditions with context switches.
+ * 
+ * Arguments:
+ *   t - pointer to the thread to remove
+ * 
+ * Returns:
+ *   void
+ */
+void
+proc_remthread(struct thread *t)
+{
+	struct proc *proc;
+	int spl;
+
+	proc = t->t_proc;
+	KASSERT(proc != NULL);
+
+	spinlock_acquire(&proc->p_lock);
+	KASSERT(proc->p_numthreads > 0);
+	proc->p_numthreads--;
+	spinlock_release(&proc->p_lock);
+
+	spl = splhigh();
+	t->t_proc = NULL;
+	splx(spl);
+}
+
+/*
+ * proc_getas - Get the address space of the current process
+ * 
+ * Arguments:
+ *   None
+ * 
+ * Returns:
+ *   Pointer to the address space, or NULL if no current process
+ */
+struct addrspace *
+proc_getas(void)
+{
+	struct addrspace *as;
+	struct proc *proc = curproc;
+
+	if (proc == NULL) {
+		return NULL;
+	}
+
+	spinlock_acquire(&proc->p_lock);
+	as = proc->p_addrspace;
+	spinlock_release(&proc->p_lock);
+	return as;
+}
+
+/*
+ * proc_setas - Set the address space of the current process
+ * 
+ * Replaces the current process's address space with a new one
+ * and returns the old one.
+ * 
+ * Arguments:
+ *   newas - pointer to the new address space (may be NULL)
+ * 
+ * Returns:
+ *   Pointer to the old address space
+ */
+struct addrspace *
+proc_setas(struct addrspace *newas)
+{
+	struct addrspace *oldas;
+	struct proc *proc = curproc;
+
+	KASSERT(proc != NULL);
+
+	spinlock_acquire(&proc->p_lock);
+	oldas = proc->p_addrspace;
+	proc->p_addrspace = newas;
+	spinlock_release(&proc->p_lock);
+	return oldas;
+}
+
+
+
+/*
+ * proc_wait - Wait for a process to terminate
+ * 
+ * Blocks the calling process until the specified process terminates,
+ * then retrieves its exit status and destroys the process structure.
+ * Uses either semaphores or condition variables for synchronization.
+ * 
+ * Arguments:
+ *   proc - pointer to the process to wait for
+ * 
+ * Returns:
+ *   Exit status of the terminated process
+ */
+int 
+proc_wait(struct proc *proc)
+{
+#if OPT_WAITPID
+	int return_status;
+	KASSERT(proc != NULL);
+	KASSERT(proc != kproc);
+
+#if USE_SEMAPHORE_FOR_WAITPID
+	P(proc->p_sem);
+#else
+	lock_acquire(proc->p_waitlock);
+	while(proc->terminated == false)
+		cv_wait(proc->p_cv, proc->p_waitlock);
+	lock_release(proc->p_waitlock);
+#endif
+	spinlock_acquire(&proc->p_lock);
+	while (proc->p_numthreads > 0) {
+			spinlock_release(&proc->p_lock);
+			thread_yield();
+			spinlock_acquire(&proc->p_lock);
+	}
+	spinlock_release(&proc->p_lock);
+
+	return_status = proc->p_status;
+	proc_destroy(proc);
+	return return_status;
+#else
+	(void)proc;
+	return 0;
+#endif
+}
+
+
+/*
+ * proc_signal_end - Signal that a process has terminated
+ * 
+ * Marks the process as terminated and wakes up any process
+ * waiting on it (via proc_wait). Uses either semaphores or
+ * condition variables for synchronization.
+ * 
+ * Arguments:
+ *   proc - pointer to the process that has terminated
+ * 
+ * Returns:
+ *   void
+ */
+void
+proc_signal_end(struct proc *proc)
+{
+	proc->terminated = true;
+#if USE_SEMAPHORE_FOR_WAITPID
+      V(proc->p_sem);
+#else
+      lock_acquire(proc->p_waitlock);
+      cv_signal(proc->p_cv);
+      lock_release(proc->p_waitlock);
+#endif
+}
+
+#if OPT_SHELL
+/*
+ * proc_addChild - Add a child process to parent's children list
+ * 
+ * Records a child PID in the parent process's array of children.
+ * 
+ * Arguments:
+ *   parent    - pointer to the parent process
+ *   child_pid - PID of the child process to add
+ * 
+ * Returns:
+ *   void
+ */
+void
+proc_addChild(struct proc *parent, pid_t child_pid)
+{
+	pid_t *temp;
+	int result;
+
+	temp = (pid_t *)kmalloc(sizeof(pid_t));
+	if (temp == NULL) {
+		panic("proc_addChild: out of memory");
+    }
+
+	*temp = child_pid;
+
+	spinlock_acquire(&parent->p_lock);
+	result = array_add(parent->children, (void *)temp, NULL);
+	spinlock_release(&parent->p_lock);
+
+	if (result) {
+    kfree(temp);
+    panic("proc_addChild: array_add failed");
+  }
+}
+#endif
+
+#if OPT_FILE
+/*
+ * proc_file_table_copy - Copy file descriptor table from parent to child
+ * 
+ * Used during fork() to duplicate parent's open files to the child.
+ * Each openfile's reference count is incremented since both processes
+ * now share the same openfile structures.
+ * 
+ * Arguments:
+ *   psrc  - source process (parent)
+ *   pdest - destination process (child)
+ * 
+ * Returns:
+ *   void
+ */
+void 
+proc_file_table_copy(struct proc *psrc, struct proc *pdest) {
+  int fd;
+
+  for (fd = 0; fd < OPEN_MAX; fd++) {
+    struct openfile *of;
+
+    spinlock_acquire(&psrc->fileTable_spinlock);
+    of = psrc->fileTable[fd];
+    if (of != NULL) {
+      pdest->fileTable[fd] = of;
+    } else {
+      pdest->fileTable[fd] = NULL;
+    }
+    spinlock_release(&psrc->fileTable_spinlock);
+
+    if (of != NULL) {
+      lock_acquire(of->of_lock);
+      of->countRef++;
+      lock_release(of->of_lock);
+    }
+  }
+}
+#endif
