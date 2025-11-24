@@ -38,17 +38,22 @@ void openfileIncrRefCount(struct openfile *of) {
 /*
  * file_read - Read from a regular file using VFS layer and a kernel buffer
  *
+ * This version uses a kernel buffer (kmalloc) as an intermediate buffer
+ * to transfer data from the file to userspace. This approach is required
+ * when using spinlocks for the file table synchronization.
+ *
  * Arguments:
- *   fd      - file descriptor (already validated by sys_read)
- *   buf_ptr - userspace pointer to buffer
+ *   fd      - file descriptor (must be valid and open for reading)
+ *   buf_ptr - userspace pointer to destination buffer
  *   size    - number of bytes to read
- *   retval  - output parameter: bytes actually read
+ *   retval  - output parameter: actual number of bytes read
  *
  * Returns:
- *   0 on success (retval contains bytes read, may be < size if EOF)
- *   EBADF if fd is invalid, not open, or opened write-only
+ *   0 on success (retval contains bytes read, may be < size if EOF reached)
+ *   EBADF if fd is invalid, not open, or opened write-only (O_WRONLY)
  *   ENOMEM if kernel buffer allocation fails
- *   EFAULT if copyout to userspace fails 
+ *   EFAULT if copyout to userspace fails
+ *   Other error codes from VOP_READ()
  */
 static int
 file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
@@ -65,46 +70,44 @@ file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
   
   spinlock_acquire(&curproc->fileTable_spinlock);
 
-  /* get openfile entry 
-   * validation: check if openfile entry is null */
+  /* Get openfile entry and validate */
   of = curproc->fileTable[fd];
-  if (of==NULL) {
+  if (of == NULL) {
     spinlock_release(&curproc->fileTable_spinlock);
     return EBADF;
   }
 
-  /* get vnode entry 
-   * validation: check if vnode is null */
+  /* Get vnode entry and validate */
   vn = of->vn;
-  if (vn==NULL) {
+  if (vn == NULL) {
     spinlock_release(&curproc->fileTable_spinlock);
     return EBADF;
   }
 
   spinlock_release(&curproc->fileTable_spinlock);
 
-  spinlock_acquire(&of->of_lock);
+  /* Use regular lock for openfile structure */
+  lock_acquire(of->of_lock);
 
-  /* Check permission (O_WRONLY not allowed) */ 
+  /* Check permission (O_WRONLY not allowed for read) */
   if ((of->openflags & O_ACCMODE) == O_WRONLY) {
-    spinlock_release(&of->of_lock);
+    lock_release(of->of_lock);
     return EBADF;
   }
 
+  /* Save current offset while holding the lock */
   offset = of->offset;
 
-  spinlock_release(&of->of_lock);
+  lock_release(of->of_lock);
 
   /* Allocate kernel buffer for read */
   kbuf = kmalloc(size);
-  if (kbuf == NULL) { 
+  if (kbuf == NULL) {
     return ENOMEM;
   }
 
   /* Setup kernel space UIO for read */
   uio_kinit(&iov, &ku, kbuf, size, offset, UIO_READ);
-
-  spinlock_release(&curproc->fileTable_spinlock);
 
   /* Perform read via VFS */
   result = VOP_READ(vn, &ku);
@@ -114,37 +117,41 @@ file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
   }
 
   /* Update file offset */
-  spinlock_acquire(&curproc->fileTable_spinlock);
+  lock_acquire(of->of_lock);
   of->offset = ku.uio_offset;
-  spinlock_release(&curproc->fileTable_spinlock);
+  lock_release(of->of_lock);
 
   /* Copy data from kernel buffer to userspace */
   nread = size - ku.uio_resid;
-  result = copyout(kbuf,buf_ptr,nread);
+  result = copyout(kbuf, buf_ptr, nread);
   kfree(kbuf);
 
-  if(result){
+  if (result) {
     return result;
   }
 
-  *retval = (nread);
+  *retval = nread;
   return 0;
 }
 
 /*
- * file_write - Write to a regular file using kernel buffer
- * 
+ * file_write - Write to a regular file using VFS layer and a kernel buffer
+ *
+ * This version uses a kernel buffer (kmalloc) as an intermediate buffer
+ * to transfer data from userspace to the file. This approach is required
+ * when using spinlocks for the file table synchronization.
+ *
  * Arguments:
- *   fd - file descriptor (already validated by sys_write)
- *   buf_ptr - userspace pointer to buffer containing data
- *   size - number of bytes to write
- *   retval - output parameter: bytes actually written
- * 
+ *   fd      - file descriptor (must be valid and open for writing)
+ *   buf_ptr - userspace pointer to source buffer containing data to write
+ *   size    - number of bytes to write
+ *   retval  - output parameter: actual number of bytes written
+ *
  * Returns:
  *   0 on success (retval contains bytes written, may be < size)
- *   EBADF if fd is invalid, not open, or opened read-only
+ *   EBADF if fd is invalid, not open, or opened read-only (O_RDONLY)
  *   ENOMEM if kernel buffer allocation fails
- *   EFAULT if buf_ptr points to invalid userspace memory
+ *   EFAULT if copyin from userspace fails (invalid buf_ptr)
  *   Other error codes from VOP_WRITE()
  */
 static int
@@ -155,60 +162,74 @@ file_write(int fd, userptr_t buf_ptr, size_t size, int *retval) {
   struct vnode *vn;
   struct openfile *of;
   void *kbuf;
+  off_t offset;
 
   if (fd < 0 || fd >= OPEN_MAX)
     return EBADF;
   
   spinlock_acquire(&curproc->fileTable_spinlock);
 
+  /* Get openfile entry and validate */
   of = curproc->fileTable[fd];
   if (of == NULL) {
     spinlock_release(&curproc->fileTable_spinlock);
     return EBADF;
   }
 
+  /* Get vnode entry and validate */
   vn = of->vn;
   if (vn == NULL) {
     spinlock_release(&curproc->fileTable_spinlock);
     return EBADF;
   }
 
+  spinlock_release(&curproc->fileTable_spinlock);
+
+  /* Use regular lock for openfile structure */
+  lock_acquire(of->of_lock);
+
+  /* Check permission (O_RDONLY not allowed for write) */
   if ((of->openflags & O_ACCMODE) == O_RDONLY) {
-    spinlock_release(&curproc->fileTable_spinlock);
+    lock_release(of->of_lock);
     return EBADF;
   }
 
+  /* Save current offset while holding the lock */
+  offset = of->offset;
+
+  lock_release(of->of_lock);
+
+  /* Allocate kernel buffer for write */
   kbuf = kmalloc(size);
   if (kbuf == NULL) {
-    spinlock_release(&curproc->fileTable_spinlock);
     return ENOMEM;
   }
 
-  result = copyin(buf_ptr,kbuf,size);
+  /* Copy data from userspace to kernel buffer */
+  result = copyin(buf_ptr, kbuf, size);
   if (result) {
     kfree(kbuf);
-    spinlock_release(&curproc->fileTable_spinlock);
     return result;
   }
 
-  uio_kinit(&iov, &ku, kbuf, size, of->offset, UIO_WRITE);
+  /* Setup kernel space UIO for write */
+  uio_kinit(&iov, &ku, kbuf, size, offset, UIO_WRITE);
 
-  spinlock_release(&curproc->fileTable_spinlock);
+  /* Perform write via VFS */
   result = VOP_WRITE(vn, &ku);
   if (result) {
     kfree(kbuf);
     return result;
   }
+
   kfree(kbuf);
 
-  spinlock_acquire(&curproc->fileTable_spinlock);
-  
+  /* Update file offset */
+  lock_acquire(of->of_lock);
   of->offset = ku.uio_offset;
-
-  spinlock_release(&curproc->fileTable_spinlock);
+  lock_release(of->of_lock);
 
   nwrite = size - ku.uio_resid;
-
   *retval = nwrite;
   return 0;
 }
@@ -216,17 +237,22 @@ file_write(int fd, userptr_t buf_ptr, size_t size, int *retval) {
 #else
 
 /*
- * file_read - Read from a regular file using VFS layer
- * 
+ * file_read - Read from a regular file using VFS layer with direct userspace access
+ *
+ * This version directly transfers data from the file to userspace without
+ * using an intermediate kernel buffer. The UIO structure is configured for
+ * userspace access (UIO_USERISPACE). This approach is used with regular locks.
+ *
  * Arguments:
- *   fd - file descriptor (already validated by sys_read)
- *   buf_ptr - userspace pointer to buffer
- *   size - number of bytes to read
- *   retval - output parameter: bytes actually read
- * 
+ *   fd      - file descriptor (must be valid and open for reading)
+ *   buf_ptr - userspace pointer to destination buffer
+ *   size    - number of bytes to read
+ *   retval  - output parameter: actual number of bytes read
+ *
  * Returns:
- *   0 on success (retval contains bytes read, may be < size if EOF)
- *   EBADF if fd is invalid, not open, or opened write-only 
+ *   0 on success (retval contains bytes read, may be < size if EOF reached)
+ *   EBADF if fd is invalid, not open, or opened write-only (O_WRONLY)
+ *   Other error codes from VOP_READ()
  */
 static int
 file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
@@ -241,16 +267,14 @@ file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
   
   spinlock_acquire(&curproc->fileTable_spinlock);
 
-  /* get openfile entry 
-   * validation: check if openfile entry is null */
+  /* Get openfile entry and validate */
   of = curproc->fileTable[fd];
   if (of==NULL) {
     spinlock_release(&curproc->fileTable_spinlock);
     return EBADF;
   }
 
-  /* get vnode entry 
-   * validation: check if vnode is null */
+  /* Get vnode entry and validate */
   vn = of->vn;
   if (vn==NULL) {
     spinlock_release(&curproc->fileTable_spinlock);
@@ -261,7 +285,7 @@ file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
 
   lock_acquire(of->of_lock);
 
-  /* Check permission (O_WRONLY not allowed) */
+  /* Check permission (O_WRONLY not allowed for read) */
   if ((of->openflags & O_ACCMODE) == O_WRONLY) {
     lock_release(of->of_lock);
     return EBADF; 
@@ -274,7 +298,8 @@ file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
    * - uio_offset: file offset where to start reading
    * - uio_segflg: UIO_USERISPACE = buffer is in userspace
    * - uio_rw: UIO_READ = this is a read operation
-   * - uio_space: address space of the buffer */
+   * - uio_space: address space of the buffer 
+   */
   iov.iov_ubase = buf_ptr;
   iov.iov_len = size;
 
@@ -293,6 +318,7 @@ file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
     return result;
   }
 
+  /* Update file offset */
   of->offset = u.uio_offset;
   lock_release(of->of_lock);
 
@@ -302,17 +328,21 @@ file_read(int fd, userptr_t buf_ptr, size_t size, int *retval) {
 
 
 /*
- * file_write - Write to a regular file without kernel buffer
- * 
+ * file_write - Write to a regular file using VFS layer with direct userspace access
+ *
+ * This version directly transfers data from userspace to the file without
+ * using an intermediate kernel buffer. The UIO structure is configured for
+ * userspace access (UIO_USERISPACE). This approach is used with regular locks.
+ *
  * Arguments:
- *   fd - file descriptor (already validated by sys_write)
- *   buf_ptr - userspace pointer to buffer containing data
- *   size - number of bytes to write
- *   retval - output parameter: bytes actually written
- * 
+ *   fd      - file descriptor (must be valid and open for writing)
+ *   buf_ptr - userspace pointer to source buffer containing data to write
+ *   size    - number of bytes to write
+ *   retval  - output parameter: actual number of bytes written
+ *
  * Returns:
  *   0 on success (retval contains bytes written, may be < size)
- *   EBADF if fd is invalid, not open, or opened read-only
+ *   EBADF if fd is invalid, not open, or opened read-only (O_RDONLY)
  *   Other error codes from VOP_WRITE()
  */
 static int
@@ -328,12 +358,14 @@ file_write(int fd, userptr_t buf_ptr, size_t size, int *retval) {
   
   spinlock_acquire(&curproc->fileTable_spinlock);
 
+  /* Get openfile entry and validate */
   of = curproc->fileTable[fd];
   if (of == NULL) {
     spinlock_release(&curproc->fileTable_spinlock);
     return EBADF;
   }
 
+  /* Get vnode entry and validate */
   vn = of->vn;
   if (vn == NULL) {
     spinlock_release(&curproc->fileTable_spinlock);
@@ -344,11 +376,21 @@ file_write(int fd, userptr_t buf_ptr, size_t size, int *retval) {
 
   lock_acquire(of->of_lock);
 
+  /* Check permission (O_RDONLY not allowed for write) */
   if ((of->openflags & O_ACCMODE) == O_RDONLY) {
     lock_release(of->of_lock);
     return EBADF;
   }
 
+  /* Setup UIO for direct userspace write
+   * - uio_iov: pointer to array of iovecs (scatter/gather I/O)
+   * - uio_iovcnt: number of iovecs (we use just 1)
+   * - uio_resid: residual count - bytes left to transfer (starts at size)
+   * - uio_offset: file offset where to start writing
+   * - uio_segflg: UIO_USERISPACE = buffer is in userspace
+   * - uio_rw: UIO_WRITE = this is a write operation
+   * - uio_space: address space of the buffer
+   */  
   iov.iov_ubase = buf_ptr;
   iov.iov_len = size;
 
@@ -360,14 +402,15 @@ file_write(int fd, userptr_t buf_ptr, size_t size, int *retval) {
   u.uio_rw = UIO_WRITE;
   u.uio_space = curproc->p_addrspace;
 
+  /* Perform write via VFS */
   result = VOP_WRITE(vn, &u);
   if (result) {
     lock_release(of->of_lock);
     return result;
   }
 
+  /* Update file offset */
   of->offset = u.uio_offset;
-
   lock_release(of->of_lock);
 
   nwrite = size - u.uio_resid;
@@ -476,7 +519,6 @@ sys_open(userptr_t path, int openflags, mode_t mode, int *errp)
   }
 
   lock_acquire(of->of_lock);
-
   of->vn = v; 
   of->offset = 0;
   of->countRef = 1;
@@ -550,9 +592,7 @@ sys_close(int fd)
   }
 
   curproc->fileTable[fd] = NULL;
-
   spinlock_release(&curproc->fileTable_spinlock);
-
   lock_acquire(of->of_lock);
 
   if (of->vn == NULL) {
@@ -561,9 +601,7 @@ sys_close(int fd)
   }
 
   vn = of->vn;
-
   KASSERT(of->countRef > 0);
-
   of->countRef--;
 
   if (of->countRef > 0) {
@@ -575,7 +613,6 @@ sys_close(int fd)
   lock_to_destroy = of->of_lock;
 
   lock_release(of->of_lock);
-
   vfs_close(vn);
   lock_destroy(lock_to_destroy);
 
@@ -770,35 +807,34 @@ sys_lseek(int fd, off_t pos, int whence, int32_t *retval, int32_t *retval2)
   spinlock_release(&curproc->fileTable_spinlock);
 
   switch (whence) {
-      case SEEK_SET:
-        new_offset = pos;
-        break;
-        
-      case SEEK_CUR:
-        lock_acquire(of->of_lock);
-        
-        if (of->vn != vn) {
-          lock_release(of->of_lock);
-          return EBADF;
-        }
-        
-        new_offset = of->offset + pos;
+    case SEEK_SET:
+      new_offset = pos;
+      break;
+      
+    case SEEK_CUR:
+      lock_acquire(of->of_lock);
+      
+      if (of->vn != vn) {
         lock_release(of->of_lock);
-        break;
-        
-      case SEEK_END:
-        
-        result = VOP_STAT(vn, &statbuf);
-        if (result) {
-          return result;
-        }
-        
-        new_offset = statbuf.st_size + pos;
-        break;
-        
-      default:
-        return EINVAL;
-    }
+        return EBADF;
+      }
+      
+      new_offset = of->offset + pos;
+      lock_release(of->of_lock);
+      break;
+      
+    case SEEK_END:
+      result = VOP_STAT(vn, &statbuf);
+      if (result) {
+        return result;
+      }
+      
+      new_offset = statbuf.st_size + pos;
+      break;
+      
+    default:
+      return EINVAL;
+  }
 
   // seek positions less than zero are invalid
   if(new_offset < 0) {
@@ -813,7 +849,6 @@ sys_lseek(int fd, off_t pos, int whence, int32_t *retval, int32_t *retval2)
 
   of->offset = new_offset;
   lock_release(of->of_lock);
-
 
   *retval = (int32_t)(new_offset >> 32); /* most significant bits */
   *retval2 = (int32_t)(new_offset & 0x00000000FFFFFFFF); /* least significant bits */
