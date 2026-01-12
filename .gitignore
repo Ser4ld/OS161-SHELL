@@ -1,0 +1,6 @@
+*
+!.gitignore
+!README.md
+!report_OS161_SHELL.pdf
+!src/
+!src/**
