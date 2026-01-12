@@ -199,7 +199,6 @@ Before starting, make sure you have:
 Once in the shell, you can execute commands:
 
 ```bash
-OS/161$ /bin/ls          # List files
 OS/161$ /bin/cat testfile # Display file contents
 OS/161$ /bin/cp testfile testfilecopy # Copy files
 OS/161$ /testbin/forktest  # Run test programs
@@ -280,4 +279,4 @@ This project is developed for academic purposes as part of the System and Device
 
 ---
 
-**Note**: This implementation uses DUMBVM for virtual memory management. For production use, a complete VM system should be implemented (Assignment 3 in typical OS/161 courses).
+**Note**: This implementation uses DUMBVM for virtual memory management. For production use, a complete VM system should be implementeds.
