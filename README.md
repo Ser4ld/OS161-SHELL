@@ -8,19 +8,19 @@
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
-- [Project Overview](#-project-overview)
-- [Implemented Features](#-implemented-features)
-- [Project Structure](#-project-structure)
-- [Build Instructions](#-build-instructions)
-- [Usage](#-usage)
-- [Testing](#-testing)
-- [Authors](#-authors)
+- [Project Overview](#project-overview)
+- [Implemented Features](#implemented-features)
+- [Project Structure](#project-structure)
+- [Build Instructions](#build-instructions)
+- [Usage](#usage)
+- [Testing](#testing)
+- [Authors](#authors)
 
 ---
 
-## 🎯 Project Overview
+## Project Overview
 
 This repository contains a complete implementation of the **OS/161 operating system kernel**, including:
 
@@ -34,9 +34,9 @@ The project extends the baseline OS/161 kernel with production-quality implement
 
 ---
 
-## ✨ Implemented Features
+## Implemented Features
 
-### 🔧 Core System Calls
+### Core System Calls
 
 #### Process Management
 - **`fork()`** - Create child processes with proper memory space duplication
@@ -55,13 +55,13 @@ The project extends the baseline OS/161 kernel with production-quality implement
 - **`chdir()`** - Change current working directory
 - **`__getcwd()`** - Get current working directory path
 
-### 🧵 Synchronization
+### Synchronization
 
 - **Locks** - Mutual exclusion with sleep-based blocking
 - **Condition Variables** - Thread coordination and signaling
 - **Semaphores** - Counting semaphores for resource management (userland support via `semfs`)
 
-### 🖥️ Process and Thread Management
+### Process and Thread Management
 
 - **Process Table** - Global process tracking with PID assignment
 - **Parent-Child Relationships** - Proper process hierarchy management
@@ -69,14 +69,14 @@ The project extends the baseline OS/161 kernel with production-quality implement
 - **Zombie Process Handling** - Cleanup of terminated processes
 - **File Descriptor Table** - Per-process open file management (up to 64 descriptors)
 
-### 📂 File System
+### File System
 
 - **System File Table** - Global tracking of open files (up to 128 system-wide)
 - **Reference Counting** - Automatic resource cleanup
 - **Offset Management** - Independent file positions per descriptor
 - **Console I/O** - Standard input/output/error stream support
 
-### 🐚 Shell (`sh`)
+### Shell (`sh`)
 
 - Interactive command execution
 - Background job support with `&` operator
@@ -86,7 +86,7 @@ The project extends the baseline OS/161 kernel with production-quality implement
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 os161/
@@ -129,15 +129,20 @@ os161/
 
 ---
 
-## 🔨 Build Instructions
+## Build Instructions
 
 ### Prerequisites
 
-- **System/161 simulator** (version 2.x)
-- **OS/161 toolchain** (`mips-harvard-os161-gcc`, `bmake`)
-- **Linux environment** (or compatible Unix system)
+This project is designed to run inside a Docker container with the OS/161 development environment pre-configured.
 
-### Building the Kernel
+Before starting, make sure you have:
+
+- OS/161 source tree checked out in `~/os161`
+- System/161 simulator (`sys161`)
+- OS/161 toolchain (`mips-harvard-os161-gcc`, `bmake`, etc.)
+- Your repo should live inside `~/os161/src/`
+
+### Build Steps
 
 1. **Configure the kernel**:
    ```bash
@@ -145,36 +150,27 @@ os161/
    ./config PROJECT
    ```
 
-2. **Build dependencies**:
+2. **Build the kernel** (clean, dependencies, compile, and install):
    ```bash
    cd ~/os161/src/kern/compile/PROJECT
-   bmake depend
+   bmake clean && bmake depend && bmake && bmake install
    ```
 
-3. **Compile the kernel**:
+3. **Build userland programs**:
    ```bash
-   bmake
+   cd ~/os161/src/userland
+   bmake && bmake install
    ```
 
-4. **Install the kernel**:
+4. **Run the kernel**:
    ```bash
-   bmake install
+   cd ~/os161/root
+   sys161 kernel
    ```
-   The kernel will be installed to `~/os161/root/kernel`.
-
-### Building User Programs
-
-```bash
-cd ~/os161/src
-bmake
-bmake install
-```
-
-This compiles all userland programs (shell, test programs, utilities) and installs them to `~/os161/root/`.
 
 ---
 
-## 🚀 Usage
+## Usage
 
 ### Running OS/161
 
@@ -204,7 +200,8 @@ Once in the shell, you can execute commands:
 
 ```bash
 OS/161$ /bin/ls          # List files
-OS/161$ /bin/cat file    # Display file contents
+OS/161$ /bin/cat testfile # Display file contents
+OS/161$ /bin/cp testfile testfilecopy # Copy files
 OS/161$ /testbin/forktest  # Run test programs
 OS/161$ /bin/sh &        # Run commands in background
 OS/161$ exit             # Exit the shell
@@ -231,7 +228,7 @@ OS/161$ /testbin/cv
 
 ---
 
-## 🧪 Testing
+## Testing
 
 The project includes comprehensive test suites:
 
@@ -254,7 +251,7 @@ sys161 kernel "p /testbin/forktest"
 
 ---
 
-## 📚 Documentation
+## Documentation
 
 - **Design Documents**: See [`src/design/`](src/design/) for architecture notes
 - **Manual Pages**: HTML documentation in [`src/man/`](src/man/)
@@ -262,7 +259,7 @@ sys161 kernel "p /testbin/forktest"
 
 ---
 
-## 👥 Authors
+## Authors
 
 **Davide Santurbano** & **Luca Faieta**  
 Politecnico di Torino - Computer Engineering  
@@ -270,13 +267,13 @@ Academic Year: 2024/2025
 
 ---
 
-## 📄 License
+## License
 
 This project is developed for academic purposes as part of the System and Device Programming course. OS/161 is Copyright (c) 2000, 2001, 2002, 2003, 2004, 2005, 2008, 2009 President and Fellows of Harvard College.
 
 ---
 
-## 🔗 References
+## References
 
 - [OS/161 Official Documentation](http://os161.eecs.harvard.edu/)
 - [System/161 Simulator](http://os161.eecs.harvard.edu/download/)
